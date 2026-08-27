@@ -76,6 +76,8 @@ QString commonStyle()
     return QStringLiteral(
         "QWidget { color: #C8EEFF; font-family: 'Microsoft YaHei UI', 'Microsoft YaHei', Arial; }"
         "QToolTip { color: #DDF8FF; background: #09172C; border: 1px solid #00D2FF; padding: 5px 8px; }"
+        "QMessageBox { background: #F5FAFF; }"
+        "QMessageBox QLabel { color: #102A50; font-weight: 600; }"
         "QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { background: #0B1D37; border: 1px solid #285AA5; border-radius: 5px; padding: 7px 10px; color: #DDF8FF; selection-background-color: #2563EB; }"
         "QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { border: 1px solid #00F2FE; }"
         "QComboBox::drop-down { border: 0px; width: 26px; }"

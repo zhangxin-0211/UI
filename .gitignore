@@ -1,6 +1,8 @@
 # Qt Creator user settings and build output
 .qtcreator/
 build*/
+b-msvc/
+build-camera-*/
 
 # Deployed runtime package; generate from the Release build when needed
 dist/
@@ -19,3 +21,11 @@ qrc_*.cpp
 *.o
 *.obj
 *.exe
+
+# OpenCV runtime binaries are copied locally after build. The debug DLL is
+# larger than GitHub's normal single-file limit and must not be committed.
+third_party/opencv/x64/vc15/bin/*.dll
+third_party/opencv/x64/vc15/bin/*.pdb
+
+# Local map authorization: never commit API credentials or provider URLs.
+amap.local.ini

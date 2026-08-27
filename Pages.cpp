@@ -1,5 +1,7 @@
 #include "Pages.h"
+#include "CameraController.h"
 #include "DemoDataModel.h"
+#include "EffectController.h"
 #include "Theme.h"
 #include "Widgets.h"
 
@@ -13,16 +15,20 @@
 #include <QFormLayout>
 #include <QGridLayout>
 #include <QHeaderView>
+#include <QLinearGradient>
 #include <QLabel>
 #include <QMessageBox>
 #include <QPushButton>
 #include <QSettings>
 #include <QSpinBox>
+#include <QSignalBlocker>
 #include <QTabWidget>
 #include <QTableWidget>
 #include <QTimer>
 #include <QTextStream>
 #include <QVBoxLayout>
+#include <QPainter>
+#include <QPainterPath>
 #include <QtMath>
 #include <algorithm>
 
@@ -91,6 +97,146 @@ QString csvCell(QString value)
     value.replace(QLatin1Char('"'), QStringLiteral("\"\""));
     return QStringLiteral("\"") + value + QStringLiteral("\"");
 }
+
+QColor withAlpha(QColor color, int alpha)
+{
+    color.setAlpha(qBound(0, alpha, 255));
+    return color;
+}
+
+class SonarVolumePlaceholder final : public QWidget
+{
+public:
+    explicit SonarVolumePlaceholder(QWidget *parent = nullptr) : QWidget(parent)
+    {
+        setMinimumSize(600, 380);
+        connect(EffectController::instance(), &EffectController::frameAdvanced, this,
+                [this](qreal phase, qreal) {
+            if (!isVisible()) return;
+            m_phase = phase;
+            update();
+        });
+    }
+
+protected:
+    void paintEvent(QPaintEvent *) override
+    {
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing);
+        const QRectF frame = rect().adjusted(2, 2, -2, -2);
+        QLinearGradient fill(frame.topLeft(), frame.bottomRight());
+        fill.setColorAt(0.0, Theme::panelAlt());
+        fill.setColorAt(1.0, Theme::backgroundDeep());
+        painter.setPen(QPen(withAlpha(Theme::border(), 145), 1.2));
+        painter.setBrush(fill);
+        painter.drawRoundedRect(frame, 22, 22);
+
+        const QPainterPath clip = [] (const QRectF &area) {
+            QPainterPath path;
+            path.addRoundedRect(area, 22, 22);
+            return path;
+        }(frame);
+        painter.setClipPath(clip);
+
+        const QRectF volumeArea = frame.adjusted(frame.width() * 0.10, 50,
+                                                  -frame.width() * 0.10, -34);
+        const qreal width = volumeArea.width();
+        const qreal height = volumeArea.height();
+        const QPointF frontTop(volumeArea.left() + width * 0.28, volumeArea.top() + height * 0.21);
+        const QPointF frontBottom(volumeArea.left() + width * 0.28, volumeArea.bottom() - height * 0.12);
+        const QPointF rearTop(volumeArea.right() - width * 0.18, volumeArea.top() + height * 0.34);
+        const QPointF rearBottom(volumeArea.right() - width * 0.18, volumeArea.bottom());
+
+        QPolygonF front;
+        front << frontTop << QPointF(frontTop.x(), frontBottom.y()) << frontBottom
+              << QPointF(frontBottom.x() + width * 0.31, frontBottom.y() - height * 0.12)
+              << QPointF(frontTop.x() + width * 0.31, frontTop.y() - height * 0.12);
+        QPolygonF rear;
+        rear << rearTop << QPointF(rearTop.x(), rearBottom.y()) << rearBottom
+             << QPointF(rearBottom.x() + width * 0.22, rearBottom.y() - height * 0.09)
+             << QPointF(rearTop.x() + width * 0.22, rearTop.y() - height * 0.09);
+
+        QLinearGradient glowGradient(frame.topLeft(), frame.bottomRight());
+        glowGradient.setColorAt(0.0, withAlpha(Theme::accent(), 14));
+        glowGradient.setColorAt(0.55, withAlpha(Theme::iceCyan(), 28));
+        glowGradient.setColorAt(1.0, withAlpha(Theme::plasmaViolet(), 11));
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(glowGradient);
+        QPolygonF volumeFace;
+        volumeFace << frontTop << rearTop << rearBottom << frontBottom;
+        painter.drawPolygon(volumeFace);
+
+        const QColor gridLine = withAlpha(Theme::accent(), 42);
+        painter.setPen(QPen(gridLine, 1));
+        constexpr int slices = 7;
+        for (int i = 0; i <= slices; ++i) {
+            const qreal t = static_cast<qreal>(i) / slices;
+            const QPointF left = frontTop * (1.0 - t) + frontBottom * t;
+            const QPointF right = rearTop * (1.0 - t) + rearBottom * t;
+            painter.drawLine(left, right);
+            const QPointF leftDepth = frontTop * (1.0 - t) + rearTop * t;
+            const QPointF rightDepth = frontBottom * (1.0 - t) + rearBottom * t;
+            painter.drawLine(leftDepth, rightDepth);
+        }
+
+        painter.setPen(QPen(withAlpha(Theme::iceCyan(), 145), 1.5));
+        painter.drawPolyline(front);
+        painter.drawPolyline(rear);
+        painter.drawLine(frontTop, rearTop);
+        painter.drawLine(frontBottom, rearBottom);
+
+        const qreal scanX = volumeArea.left() + std::fmod(m_phase * 20.0, qMax<qreal>(1.0, width));
+        QLinearGradient scan(scanX - 24, 0, scanX + 24, 0);
+        scan.setColorAt(0.0, withAlpha(Theme::iceCyan(), 0));
+        scan.setColorAt(0.5, withAlpha(Theme::iceCyan(), 55));
+        scan.setColorAt(1.0, withAlpha(Theme::plasmaViolet(), 0));
+        painter.fillRect(QRectF(scanX - 24, volumeArea.top(), 48, volumeArea.height()), scan);
+
+        const QPointF origin(frontBottom.x() - 18, frontBottom.y() + 5);
+        painter.setPen(QPen(Theme::iceCyan(), 2));
+        painter.drawLine(origin, origin + QPointF(50, 0));
+        painter.setPen(QPen(withAlpha(Theme::glow(), 180), 2));
+        painter.drawLine(origin, origin + QPointF(0, -44));
+        painter.setPen(QPen(withAlpha(Theme::plasmaLight(), 170), 2));
+        painter.drawLine(origin, origin + QPointF(30, -24));
+        painter.setFont(Theme::font(8, true));
+        painter.setPen(Theme::textMuted());
+        painter.drawText(QRectF(origin + QPointF(54, -10), QSizeF(30, 18)), QStringLiteral("X"));
+        painter.drawText(QRectF(origin + QPointF(-10, -63), QSizeF(30, 18)), QStringLiteral("Z"));
+        painter.drawText(QRectF(origin + QPointF(32, -39), QSizeF(30, 18)), QStringLiteral("Y"));
+
+        const QRectF message(frame.center().x() - qMin<qreal>(275, frame.width() * 0.35),
+                             frame.center().y() - 45,
+                             qMin<qreal>(550, frame.width() * 0.70), 90);
+        painter.setPen(QPen(withAlpha(Theme::border(), 140), 1));
+        painter.setBrush(withAlpha(Theme::backgroundDeep(), 218));
+        painter.drawRoundedRect(message, 9, 9);
+        painter.setFont(Theme::font(15, true));
+        painter.setPen(Theme::value());
+        painter.drawText(message.adjusted(12, 10, -12, -36), Qt::AlignCenter,
+                         QStringLiteral("声纳三维点云接口待接入"));
+        painter.setFont(Theme::font(9));
+        painter.setPen(Theme::textMuted());
+        painter.drawText(message.adjusted(12, 44, -12, -7), Qt::AlignCenter,
+                         QStringLiteral("当前无有效声纳数据 · 等待设备与算法服务接入"));
+
+        painter.setClipping(false);
+        painter.setFont(Theme::font(8));
+        painter.setPen(Theme::textMuted());
+        painter.drawText(frame.adjusted(18, frame.height() - 28, -18, -7),
+                         Qt::AlignLeft | Qt::AlignVCenter,
+                         QStringLiteral("SONAR VOLUME · STANDBY   |   POINT CLOUD · NO DATA   |   RENDERER · RESERVED"));
+        painter.setPen(QPen(Theme::iceCyan(), 2));
+        const qreal mark = 22;
+        painter.drawLine(frame.topLeft() + QPointF(12, 12), frame.topLeft() + QPointF(12 + mark, 12));
+        painter.drawLine(frame.topLeft() + QPointF(12, 12), frame.topLeft() + QPointF(12, 12 + mark));
+        painter.drawLine(frame.bottomRight() - QPointF(12 + mark, 12), frame.bottomRight() - QPointF(12, 12));
+        painter.drawLine(frame.bottomRight() - QPointF(12, 12 + mark), frame.bottomRight() - QPointF(12, 12));
+    }
+
+private:
+    qreal m_phase = 0.0;
+};
 
 }
 
@@ -204,15 +350,10 @@ RoutePage::RoutePage(DemoDataModel *model, QWidget *parent) : DashboardPage(pare
     NeonPanel *waypointPanel = new NeonPanel(QStringLiteral("期望路径点设置 / WAYPOINTS"));
     QVBoxLayout *waypointLayout = new QVBoxLayout(waypointPanel);
     waypointLayout->setContentsMargins(12, 49, 12, 12);
-    m_waypoints = new QTableWidget(8, 3);
+    m_waypoints = new QTableWidget(0, 3);
     configureTable(m_waypoints);
     m_waypoints->setHorizontalHeaderLabels({QStringLiteral("序号"), QStringLiteral("经度 / X"), QStringLiteral("纬度 / Y")});
     m_waypoints->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
-    for (int i = 0; i < m_waypoints->rowCount(); ++i) {
-        m_waypoints->setItem(i, 0, new QTableWidgetItem(QString::number(i + 1)));
-        m_waypoints->setItem(i, 1, new QTableWidgetItem(QString::number(120.102 + i * 0.0013, 'f', 4)));
-        m_waypoints->setItem(i, 2, new QTableWidgetItem(QString::number(30.206 + i * 0.0008, 'f', 4)));
-    }
     waypointLayout->addWidget(m_waypoints, 1);
     QGridLayout *actions = new QGridLayout;
     QPushButton *addRow = actionButton(QStringLiteral("添加行"));
@@ -235,12 +376,11 @@ RoutePage::RoutePage(DemoDataModel *model, QWidget *parent) : DashboardPage(pare
 
     connect(addRow, &QPushButton::clicked, this, [this] {
         requestAction(ActionId::AddWaypoint);
-        const int row = m_waypoints->rowCount();
-        m_waypoints->insertRow(row);
-        m_waypoints->setItem(row, 0, new QTableWidgetItem(QString::number(row + 1)));
-        m_waypoints->setItem(row, 1, new QTableWidgetItem(QStringLiteral("0.0000")));
-        m_waypoints->setItem(row, 2, new QTableWidgetItem(QStringLiteral("0.0000")));
-        m_waypoints->setCurrentCell(row, 1);
+        RoutePoint point;
+        point.id = QStringLiteral("wp-%1").arg(QDateTime::currentMSecsSinceEpoch());
+        point.coordinateSystem = CoordinateSystem::Wgs84;
+        appendWaypointRow(point);
+        m_waypoints->setCurrentCell(m_waypoints->rowCount() - 1, 1);
         syncMapWaypoints();
     });
     connect(removeRow, &QPushButton::clicked, this, [this] {
@@ -248,8 +388,7 @@ RoutePage::RoutePage(DemoDataModel *model, QWidget *parent) : DashboardPage(pare
         int row = m_waypoints->currentRow();
         if (row < 0) row = m_waypoints->rowCount() - 1;
         if (row >= 0) m_waypoints->removeRow(row);
-        for (int i = 0; i < m_waypoints->rowCount(); ++i)
-            m_waypoints->setItem(i, 0, new QTableWidgetItem(QString::number(i + 1)));
+        renumberWaypointRows();
         syncMapWaypoints();
     });
     connect(clearRows, &QPushButton::clicked, this, [this] {
@@ -259,16 +398,19 @@ RoutePage::RoutePage(DemoDataModel *model, QWidget *parent) : DashboardPage(pare
     });
     connect(defaults, &QPushButton::clicked, this, [this] {
         requestAction(ActionId::LoadDefaults);
-        m_waypoints->setRowCount(6);
+        m_waypoints->setRowCount(0);
         for (int i = 0; i < 6; ++i) {
-            m_waypoints->setItem(i, 0, new QTableWidgetItem(QString::number(i + 1)));
-            m_waypoints->setItem(i, 1, new QTableWidgetItem(QString::number(120.102 + i * 0.0013, 'f', 4)));
-            m_waypoints->setItem(i, 2, new QTableWidgetItem(QString::number(30.206 + i * 0.0008, 'f', 4)));
+            RoutePoint point;
+            point.id = QStringLiteral("wp-default-%1").arg(i + 1);
+            point.coordinateSystem = CoordinateSystem::Wgs84;
+            point.position = QPointF(120.102 + i * 0.0013, 30.206 + i * 0.0008);
+            appendWaypointRow(point);
         }
         syncMapWaypoints();
     });
     connect(drawRoute, &QPushButton::clicked, this, [this, drawRoute] {
         requestAction(ActionId::DrawRoute);
+        m_mapPlanning->requestRoutePlanning();
         drawRoute->setText(QStringLiteral("规划算法接口已预留"));
         QTimer::singleShot(900, drawRoute, [drawRoute] { drawRoute->setText(QStringLiteral("绘制路径")); });
     });
@@ -280,10 +422,80 @@ RoutePage::RoutePage(DemoDataModel *model, QWidget *parent) : DashboardPage(pare
     connect(m_waypoints, &QTableWidget::cellChanged, this, [this](int, int) {
         syncMapWaypoints();
     });
+    connect(m_mapPlanning, &MapPlanningWidget::waypointCreated, this, [this](const RoutePoint &point) {
+        requestAction(ActionId::AddWaypoint);
+        appendWaypointRow(point);
+        syncMapWaypoints();
+    });
+    connect(m_mapPlanning, &MapPlanningWidget::waypointUpdated, this, [this](const RoutePoint &point) {
+        updateWaypointRow(point);
+        syncMapWaypoints();
+    });
+    connect(m_mapPlanning, &MapPlanningWidget::waypointRemoved, this, [this](const QString &id) {
+        for (int row = 0; row < m_waypoints->rowCount(); ++row) {
+            QTableWidgetItem *item = m_waypoints->item(row, 0);
+            if (item && item->data(Qt::UserRole).toString() == id) {
+                requestAction(ActionId::RemoveWaypoint);
+                m_waypoints->removeRow(row);
+                renumberWaypointRows();
+                syncMapWaypoints();
+                break;
+            }
+        }
+    });
+    connect(m_mapPlanning, &MapPlanningWidget::amapLocationReceived,
+            this, &RoutePage::amapLocationReceived);
+    connect(m_mapPlanning, &MapPlanningWidget::amapLocationFailed,
+            this, &RoutePage::amapLocationFailed);
 
     connect(model, &DemoDataModel::sampleReady, this, [this](double phase, int) {
+        if (!m_pageActive || !isVisible()) return;
+        if (++m_liveTrackUpdateDivider < 4) return;
+        m_liveTrackUpdateDivider = 0;
         m_liveTrack->append(qSin(phase * 0.55) * 0.6, qCos(phase * 0.38) * 0.7);
     });
+}
+
+void RoutePage::warmUpMap()
+{
+    if (m_mapPlanning) m_mapPlanning->warmUp();
+}
+
+void RoutePage::setVehiclePosition(const RoutePoint &position)
+{
+    if (m_mapPlanning) m_mapPlanning->setVehiclePosition(position);
+}
+
+void RoutePage::setCurrentLocation(const LocationFix &fix, LocationSource source)
+{
+    if (m_mapPlanning) m_mapPlanning->setCurrentLocation(fix, source);
+}
+
+void RoutePage::setLocationStatus(const QString &status)
+{
+    if (m_mapPlanning) m_mapPlanning->setLocationStatus(status);
+}
+
+void RoutePage::setPlannedPath(const RoutePath &path)
+{
+    if (m_mapPlanning) m_mapPlanning->setPlannedPath(path);
+}
+
+void RoutePage::setPageActive(bool active)
+{
+    m_pageActive = active;
+    if (active) warmUpMap();
+    if (m_mapPlanning) m_mapPlanning->setPageActive(active);
+}
+
+void RoutePage::setMapHost(QWidget *host)
+{
+    if (m_mapPlanning) m_mapPlanning->setWebViewHost(host);
+}
+
+void RoutePage::syncMapHostGeometry()
+{
+    if (m_mapPlanning) m_mapPlanning->syncWebViewGeometry();
 }
 
 QVector<RoutePoint> RoutePage::routePointsFromTable() const
@@ -293,15 +505,54 @@ QVector<RoutePoint> RoutePage::routePointsFromTable() const
     points.reserve(m_waypoints->rowCount());
     for (int row = 0; row < m_waypoints->rowCount(); ++row) {
         RoutePoint point;
-        point.id = m_waypoints->item(row, 0) ? m_waypoints->item(row, 0)->text()
-                                             : QString::number(row + 1);
+        QTableWidgetItem *indexItem = m_waypoints->item(row, 0);
+        point.id = indexItem ? indexItem->data(Qt::UserRole).toString() : QString();
+        if (point.id.isEmpty()) point.id = QStringLiteral("wp-%1").arg(row + 1);
         const double first = m_waypoints->item(row, 1) ? m_waypoints->item(row, 1)->text().toDouble() : 0.0;
         const double second = m_waypoints->item(row, 2) ? m_waypoints->item(row, 2)->text().toDouble() : 0.0;
         point.position = QPointF(first, second);
-        point.coordinateSystem = CoordinateSystem::Unspecified;
+        point.coordinateSystem = indexItem
+            ? static_cast<CoordinateSystem>(indexItem->data(Qt::UserRole + 1).toInt())
+            : CoordinateSystem::Wgs84;
         points.append(point);
     }
     return points;
+}
+
+void RoutePage::appendWaypointRow(const RoutePoint &point)
+{
+    const int row = m_waypoints->rowCount();
+    m_waypoints->insertRow(row);
+    QTableWidgetItem *index = new QTableWidgetItem(QString::number(row + 1));
+    index->setData(Qt::UserRole, point.id);
+    index->setData(Qt::UserRole + 1, static_cast<int>(point.coordinateSystem));
+    index->setFlags(index->flags() & ~Qt::ItemIsEditable);
+    m_waypoints->setItem(row, 0, index);
+    m_waypoints->setItem(row, 1, new QTableWidgetItem(QString::number(point.position.x(), 'f', 6)));
+    m_waypoints->setItem(row, 2, new QTableWidgetItem(QString::number(point.position.y(), 'f', 6)));
+}
+
+void RoutePage::updateWaypointRow(const RoutePoint &point)
+{
+    const QSignalBlocker blocker(m_waypoints);
+    for (int row = 0; row < m_waypoints->rowCount(); ++row) {
+        QTableWidgetItem *index = m_waypoints->item(row, 0);
+        if (!index || index->data(Qt::UserRole).toString() != point.id) continue;
+        index->setData(Qt::UserRole + 1, static_cast<int>(point.coordinateSystem));
+        m_waypoints->item(row, 1)->setText(QString::number(point.position.x(), 'f', 6));
+        m_waypoints->item(row, 2)->setText(QString::number(point.position.y(), 'f', 6));
+        return;
+    }
+    appendWaypointRow(point);
+}
+
+void RoutePage::renumberWaypointRows()
+{
+    const QSignalBlocker blocker(m_waypoints);
+    for (int row = 0; row < m_waypoints->rowCount(); ++row) {
+        if (QTableWidgetItem *index = m_waypoints->item(row, 0))
+            index->setText(QString::number(row + 1));
+    }
 }
 
 void RoutePage::syncMapWaypoints()
@@ -319,17 +570,20 @@ VideoPage::VideoPage(DemoDataModel *model, QWidget *parent) : DashboardPage(pare
 
     QVBoxLayout *left = new QVBoxLayout;
     QHBoxLayout *controls = new QHBoxLayout;
-    QLabel *camera = label(QStringLiteral("CAP 0 · 水下作业摄像头 · SINGLE CAMERA"), 10, true);
-    camera->setMinimumHeight(42);
-    camera->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
-    camera->setStyleSheet(QStringLiteral("color:%1;background:%2;border:1px solid %3;border-radius:6px;padding:8px 14px;")
+    m_cameraInfo = label(QStringLiteral("摄像头 0 · USB 摄像头 · 等待连接"), 10, true);
+    m_cameraInfo->setMinimumHeight(42);
+    m_cameraInfo->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    m_cameraInfo->setStyleSheet(QStringLiteral("color:%1;background:%2;border:1px solid %3;border-radius:6px;padding:8px 14px;")
                               .arg(Theme::text().name(), Theme::background().name(), Theme::accent().darker(150).name()));
-    QPushButton *play = actionButton(QStringLiteral("开始播放"));
-    play->setMinimumWidth(220);
-    controls->addWidget(camera, 1);
-    controls->addWidget(play);
+    m_playButton = actionButton(QStringLiteral("开始播放"));
+    m_playButton->setMinimumWidth(220);
+    controls->addWidget(m_cameraInfo, 1);
+    controls->addWidget(m_playButton);
     left->addLayout(controls);
     m_video = new VideoPlaceholder;
+    // 摄像头连接时播放按钮会短暂禁用；让焦点落到不可编辑的视频区域，
+    // 避免 Qt 自动把焦点转交给右侧的 X 位置输入框。
+    m_video->setFocusPolicy(Qt::StrongFocus);
     left->addWidget(m_video, 1);
 
     NeonPanel *controlPanel = new NeonPanel(QStringLiteral("悬停控制 / STATION KEEPING"));
@@ -358,18 +612,97 @@ VideoPage::VideoPage(DemoDataModel *model, QWidget *parent) : DashboardPage(pare
     root->addLayout(left, 73);
     root->addWidget(controlPanel, 27);
 
-    connect(play, &QPushButton::clicked, this, [this, play] {
+    m_cameraController = new CameraController(this);
+    m_frameTimer = new QTimer(this);
+    m_frameTimer->setInterval(33);
+    m_frameTimer->setTimerType(Qt::PreciseTimer);
+    connect(m_frameTimer, &QTimer::timeout, this, [this] {
+        if (!isVisible()) return;
+        const QImage frame = m_cameraController->takeLatestFrame();
+        if (!frame.isNull())
+            m_video->setFrame(frame);
+    });
+    m_frameTimer->start();
+
+    connect(m_cameraController, &CameraController::streamOpened, this,
+            [this](const CameraStreamInfo &info) {
+        const QString fps = info.fps > 0.0 ? QString::number(info.fps, 'f', info.fps < 10.0 ? 1 : 0)
+                                           : QStringLiteral("未知");
+        m_cameraInfo->setText(QStringLiteral("摄像头 %1 · %2×%3 · %4 FPS · %5")
+                                  .arg(info.deviceIndex).arg(info.width).arg(info.height).arg(fps, info.backend));
+    });
+    connect(m_cameraController, &CameraController::stateChanged, this,
+            [this](CameraState state, const QString &message) {
+        m_video->setStreamState(state, message);
+        switch (state) {
+        case CameraState::Opening:
+            m_video->setFocus(Qt::OtherFocusReason);
+            m_playButton->setText(QStringLiteral("正在连接…"));
+            m_playButton->setEnabled(false);
+            m_cameraInfo->setText(QStringLiteral("摄像头 0 · 正在尝试连接"));
+            break;
+        case CameraState::Streaming:
+            m_playButton->setText(QStringLiteral("停止播放"));
+            m_playButton->setEnabled(true);
+            break;
+        case CameraState::Error:
+            m_playButton->setText(QStringLiteral("开始播放"));
+            m_playButton->setEnabled(true);
+            m_cameraInfo->setText(QStringLiteral("摄像头 0 · 连接失败"));
+            break;
+        case CameraState::Stopped:
+            m_playButton->setText(QStringLiteral("开始播放"));
+            m_playButton->setEnabled(true);
+            m_cameraInfo->setText(QStringLiteral("摄像头 0 · USB 摄像头 · 等待连接"));
+            break;
+        }
+    });
+
+    connect(m_playButton, &QPushButton::clicked, this, [this] {
         requestAction(ActionId::StartVideo);
-        const bool nowPlaying = play->text() == QStringLiteral("开始播放");
-        m_video->setPlaying(nowPlaying);
-        play->setText(nowPlaying ? QStringLiteral("停止播放") : QStringLiteral("开始播放"));
-        m_coordinates->setText(nowPlaying ? QStringLiteral("视觉链路：ONLINE") : QStringLiteral("目标锁定：待命"));
+        if (m_cameraController->isRunning()) {
+            m_video->setFocus(Qt::OtherFocusReason);
+            m_playButton->setText(QStringLiteral("正在停止…"));
+            m_playButton->setEnabled(false);
+            m_cameraController->stopCamera();
+        } else {
+            m_video->setFocus(Qt::OtherFocusReason);
+            m_video->clearFrame();
+            m_cameraController->startCamera(0);
+        }
     });
     connect(stationKeep, &QPushButton::clicked, this, [this, stationKeep] {
         requestAction(ActionId::SendStationKeeping);
         stationKeep->setText(QStringLiteral("功能接口已预留"));
         QTimer::singleShot(1000, stationKeep, [stationKeep] { stationKeep->setText(QStringLiteral("发送悬停指令")); });
     });
+}
+
+SonarPage::SonarPage(QWidget *parent) : DashboardPage(parent)
+{
+    QVBoxLayout *layout = new QVBoxLayout(this);
+    layout->setContentsMargins(16, 4, 16, 16);
+    layout->setSpacing(12);
+
+    NeonPanel *volumePanel = new NeonPanel(QStringLiteral("三维声纳显示 / SONAR 3D VISUALIZATION"));
+    QVBoxLayout *volumeLayout = new QVBoxLayout(volumePanel);
+    volumeLayout->setContentsMargins(14, 49, 14, 14);
+    volumeLayout->addWidget(new SonarVolumePlaceholder, 1);
+    layout->addWidget(volumePanel, 1);
+
+    QHBoxLayout *statusRow = new QHBoxLayout;
+    statusRow->setSpacing(12);
+    QLabel *source = createMetricLabel(QStringLiteral("数据源状态"), QStringLiteral("待接入"));
+    QLabel *cloud = createMetricLabel(QStringLiteral("点云状态"), QStringLiteral("无有效数据"));
+    QLabel *renderer = createMetricLabel(QStringLiteral("渲染接口"), QStringLiteral("已预留"));
+    for (QLabel *item : {source, cloud, renderer}) {
+        item->setAlignment(Qt::AlignCenter);
+        item->setStyleSheet(QStringLiteral("color:%1;background:%2;border:1px solid %3;border-radius:6px;padding:8px;")
+                                .arg(Theme::text().name(), Theme::background().name(),
+                                     Theme::accent().darker(150).name()));
+        statusRow->addWidget(item, 1);
+    }
+    layout->addLayout(statusRow);
 }
 
 DataPage::DataPage(DemoDataModel *model, QWidget *parent) : DashboardPage(parent)
@@ -386,10 +719,10 @@ DataPage::DataPage(DemoDataModel *model, QWidget *parent) : DashboardPage(parent
     m_table->setSelectionMode(QAbstractItemView::ExtendedSelection);
     m_table->setEditTriggers(QAbstractItemView::NoEditTriggers);
     m_table->setHorizontalHeaderLabels({
-        QStringLiteral("采集时间"), QStringLiteral("序号"), QStringLiteral("xpos"),
-        QStringLiteral("ypos"), QStringLiteral("depth"), QStringLiteral("yaw"),
-        QStringLiteral("pitch"), QStringLiteral("roll"), QStringLiteral("forceX"),
-        QStringLiteral("forceY"), QStringLiteral("forceZ"), QStringLiteral("forceYAW")
+        QStringLiteral("采集时间"), QStringLiteral("序号"), QStringLiteral("横向位置"),
+        QStringLiteral("纵向位置"), QStringLiteral("深度"), QStringLiteral("艏向角"),
+        QStringLiteral("纵倾角"), QStringLiteral("横倾角"), QStringLiteral("X轴推力"),
+        QStringLiteral("Y轴推力"), QStringLiteral("Z轴推力"), QStringLiteral("偏航力矩")
     });
     m_table->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
     m_table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);

@@ -1,4 +1,5 @@
 #include "MainWindow.h"
+#include "LocationController.h"
 #include "DemoDataModel.h"
 #include "EffectController.h"
 #include "Pages.h"
@@ -24,9 +25,21 @@
 #include <QShowEvent>
 #include <QStackedWidget>
 #include <QTimer>
+#include <QVariantAnimation>
 #include <QVBoxLayout>
 #include <QtMath>
 #include <cmath>
+
+#ifdef Q_OS_WIN
+#include <windows.h>
+#include <dwmapi.h>
+#ifndef DWMWA_CAPTION_COLOR
+#define DWMWA_CAPTION_COLOR 35
+#endif
+#ifndef DWMWA_TEXT_COLOR
+#define DWMWA_TEXT_COLOR 36
+#endif
+#endif
 
 class BackgroundWidget : public QWidget
 {
@@ -119,6 +132,54 @@ protected:
     }
 };
 
+class RouteTransitionOverlay : public QWidget
+{
+public:
+    explicit RouteTransitionOverlay(QWidget *parent = nullptr) : QWidget(parent)
+    {
+        setAttribute(Qt::WA_TransparentForMouseEvents);
+    }
+
+    void setOverlayOpacity(qreal opacity)
+    {
+        m_opacity = qBound<qreal>(0.0, opacity, 1.0);
+        update();
+    }
+
+protected:
+    void paintEvent(QPaintEvent *) override
+    {
+        QPainter painter(this);
+        QColor cover = Theme::backgroundDeep();
+        cover.setAlphaF(m_opacity);
+        painter.fillRect(rect(), cover);
+    }
+
+private:
+    qreal m_opacity = 1.0;
+};
+
+class MapPrewarmCover : public QWidget
+{
+public:
+    explicit MapPrewarmCover(QWidget *parent = nullptr) : QWidget(parent)
+    {
+        setAttribute(Qt::WA_TransparentForMouseEvents);
+    }
+
+protected:
+    void paintEvent(QPaintEvent *) override
+    {
+        QPainter painter(this);
+        painter.fillRect(rect(), Theme::backgroundGradient(rect()));
+        QColor grid = Theme::accent(); grid.setAlpha(18);
+        painter.setPen(QPen(grid, 1));
+        const int spacing = qMax(36, width() / 42);
+        for (int x = 0; x < width(); x += spacing) painter.drawLine(x, 0, x, height());
+        for (int y = 0; y < height(); y += spacing) painter.drawLine(0, y, width(), y);
+    }
+};
+
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent), m_model(new DemoDataModel(this))
 {
@@ -131,6 +192,8 @@ MainWindow::MainWindow(QWidget *parent)
     qRegisterMetaType<MonitoringSettings>("MonitoringSettings");
     qRegisterMetaType<ControlMode>("ControlMode");
     qRegisterMetaType<DeviceControlParameters>("DeviceControlParameters");
+    qRegisterMetaType<LocationSource>("LocationSource");
+    qRegisterMetaType<LocationFix>("LocationFix");
     setWindowTitle(QStringLiteral("水下清洁机器人智能监控系统"));
     setMinimumSize(1280, 720);
     resize(1600, 900);
@@ -145,9 +208,20 @@ MainWindow::MainWindow(QWidget *parent)
 
     m_pages = new QStackedWidget;
     QList<DashboardPage *> pageList;
-    pageList << new RoutePage(m_model)
-             << new HealthPage(m_model)
+    m_routePage = new RoutePage(m_model);
+    m_locationController = new LocationController(this);
+    connect(m_routePage, &RoutePage::amapLocationReceived,
+            m_locationController, &LocationController::updateAmapLocation);
+    connect(m_routePage, &RoutePage::amapLocationFailed,
+            m_locationController, &LocationController::reportAmapFailure);
+    connect(m_locationController, &LocationController::currentLocationChanged,
+            m_routePage, &RoutePage::setCurrentLocation);
+    connect(m_locationController, &LocationController::statusChanged,
+            m_routePage, &RoutePage::setLocationStatus);
+    pageList << new HealthPage(m_model)
+             << m_routePage
              << new VideoPage(m_model)
+             << new SonarPage
              << new DataPage(m_model);
     for (DashboardPage *page : pageList) {
         m_pages->addWidget(page);
@@ -164,6 +238,24 @@ MainWindow::MainWindow(QWidget *parent)
     }
     layout->addWidget(m_pages, 1);
     setCentralWidget(central);
+
+    // 独立的地图宿主位于页面堆栈之后，WebEngine 可在后台持续渲染；
+    // 路径页激活时仅提升该宿主层，不重新创建或显示整页 WebView。
+    m_mapHost = new QWidget(central);
+    m_mapHost->setStyleSheet(QStringLiteral("background: transparent;"));
+    m_mapHost->lower();
+    m_mapHost->show();
+    m_mapPrewarmCover = new MapPrewarmCover(central);
+    m_mapPrewarmCover->setGeometry(m_pages->geometry());
+    m_mapPrewarmCover->show();
+    m_mapPrewarmCover->raise();
+    m_pages->raise();
+    m_routePage->setMapHost(m_mapHost);
+    QTimer::singleShot(0, this, [this] {
+        if (m_routePage) m_routePage->setMapHost(m_mapHost);
+        if (m_mapPrewarmCover && m_pages)
+            m_mapPrewarmCover->setGeometry(m_pages->geometry());
+    });
 
     navigateTo(PageId::HealthMonitoring);
     m_model->start();
@@ -216,7 +308,8 @@ QWidget *MainWindow::createNavigation()
     layout->setSpacing(26);
     m_navGroup = new QButtonGroup(this);
     m_navGroup->setExclusive(true);
-    const QStringList labels = {QStringLiteral("路径规划"), QStringLiteral("健康监控"), QStringLiteral("视频监控"), QStringLiteral("数据管理")};
+    const QStringList labels = {QStringLiteral("健康监控"), QStringLiteral("路径规划"), QStringLiteral("视频监控"),
+                                QStringLiteral("三维声纳"), QStringLiteral("数据管理")};
     layout->addStretch(1);
     for (int i = 0; i < labels.size(); ++i) {
         NavButton *button = new NavButton(labels.at(i));
@@ -242,22 +335,56 @@ void MainWindow::navigateTo(PageId page)
         return;
     }
     const int previousIndex = m_pages->currentIndex();
+    if (page == PageId::RoutePlanning && m_routePage)
+        m_routePage->warmUpMap();
     if (previousIndex == index) {
         if (index < m_navButtons.size()) m_navButtons.at(index)->setChecked(true);
+        if (isVisible() && !isMinimized())
+            EffectController::instance()->start();
         return;
     }
     QWidget *incoming = m_pages->widget(index);
     m_pages->setCurrentIndex(index);
+    if (m_routePage) m_routePage->setPageActive(page == PageId::RoutePlanning);
     if (index < m_navButtons.size()) m_navButtons.at(index)->setChecked(true);
     emit currentPageChanged(page);
+    if (isVisible() && !isMinimized())
+        EffectController::instance()->start();
+
+    if (m_mapHost && m_mapPrewarmCover) {
+        if (page == PageId::RoutePlanning) {
+            m_mapPrewarmCover->hide();
+            m_mapHost->raise();
+        } else {
+            m_mapHost->lower();
+            m_mapPrewarmCover->show();
+            m_mapPrewarmCover->raise();
+            m_pages->raise();
+        }
+    }
 
     if (!isVisible() || !incoming) return;
     m_transitioning = true;
     for (NavButton *button : m_navButtons)
         button->setEnabled(false);
+
+    // WebEngine remains in its independent host; this animation only affects
+    // the route page's Qt chrome and content, matching every other page
+    // without forcing the map through an off-screen opacity composition.
     const int direction = index > previousIndex ? 1 : -1;
     const QPoint finalPosition = incoming->pos();
     incoming->move(finalPosition + QPoint(direction * 24, 0));
+
+    // The map WebView is hosted outside QStackedWidget so it can stay warm in
+    // the background.  When the route page slides in, move that host in sync
+    // with the page; otherwise the page chrome and map briefly have different
+    // horizontal origins (the map appears shifted depending on slide direction).
+    const bool animateMapHost = page == PageId::RoutePlanning && m_mapHost
+        && m_mapHost->isVisible() && !m_mapPrewarmCover->isVisible();
+    const QPoint mapHostFinalPosition = animateMapHost ? m_mapHost->pos() : QPoint();
+    if (animateMapHost)
+        m_mapHost->move(mapHostFinalPosition + QPoint(direction * 24, 0));
+
     QGraphicsOpacityEffect *opacityEffect = new QGraphicsOpacityEffect(incoming);
     incoming->setGraphicsEffect(opacityEffect);
     opacityEffect->setOpacity(0.0);
@@ -273,8 +400,18 @@ void MainWindow::navigateTo(PageId page)
     slide->setStartValue(finalPosition + QPoint(direction * 24, 0));
     slide->setEndValue(finalPosition);
     slide->setEasingCurve(QEasingCurve::OutCubic);
+    QPropertyAnimation *mapSlide = nullptr;
+    if (animateMapHost) {
+        mapSlide = new QPropertyAnimation(m_mapHost, "pos", group);
+        mapSlide->setDuration(250);
+        mapSlide->setStartValue(mapHostFinalPosition + QPoint(direction * 24, 0));
+        mapSlide->setEndValue(mapHostFinalPosition);
+        mapSlide->setEasingCurve(QEasingCurve::OutCubic);
+    }
     connect(group, &QParallelAnimationGroup::finished, this, [this, incoming, finalPosition, group] {
         incoming->move(finalPosition);
+        if (m_mapHost && currentPage() == PageId::RoutePlanning)
+            syncMapOverlayGeometry();
         incoming->setGraphicsEffect(nullptr);
         m_transitioning = false;
         for (NavButton *button : m_navButtons)
@@ -282,6 +419,26 @@ void MainWindow::navigateTo(PageId page)
         group->deleteLater();
     });
     group->start();
+}
+
+void MainWindow::setVehiclePosition(const RoutePoint &position)
+{
+    if (m_routePage) m_routePage->setVehiclePosition(position);
+}
+
+void MainWindow::setPlannedPath(const RoutePath &path)
+{
+    if (m_routePage) m_routePage->setPlannedPath(path);
+}
+
+void MainWindow::updateGpsLocation(const LocationFix &fix)
+{
+    if (m_locationController) m_locationController->updateGpsLocation(fix);
+}
+
+void MainWindow::setGpsAvailable(bool available)
+{
+    if (m_locationController) m_locationController->setGpsAvailable(available);
 }
 
 void MainWindow::showActionHint(ActionId action)
@@ -295,7 +452,7 @@ void MainWindow::showActionHint(ActionId action)
     case ActionId::LoadDefaults: name = QStringLiteral("载入默认参数"); break;
     case ActionId::DrawRoute: name = QStringLiteral("绘制路径"); break;
     case ActionId::SendMission: name = QStringLiteral("发送任务"); break;
-    case ActionId::StartVideo: name = QStringLiteral("视频控制"); break;
+    case ActionId::StartVideo: name = QStringLiteral("摄像头控制"); state = QStringLiteral("状态已切换"); break;
     case ActionId::SendStationKeeping: name = QStringLiteral("悬停控制"); break;
     case ActionId::StartCollection: name = QStringLiteral("数据采集"); state = QStringLiteral("状态已切换"); break;
     case ActionId::ClearData: name = QStringLiteral("清空数据"); state = QStringLiteral("已完成"); break;
@@ -321,6 +478,21 @@ void MainWindow::toggleFullScreen()
     if (isFullScreen()) showNormal(); else showFullScreen();
 }
 
+void MainWindow::applyWindowChrome()
+{
+#ifdef Q_OS_WIN
+    // 保留系统标题栏的拖动、最小化和关闭按钮，仅将其颜色统一到深海蓝主题。
+    const HWND hwnd = reinterpret_cast<HWND>(winId());
+    if (!hwnd) return;
+    // 使用可辨识的深海墨蓝，而不是接近黑色的背景色；系统标题栏本身
+    // 只能接受纯色，因此取主题渐变中部的蓝色作为统一基色。
+    const COLORREF caption = RGB(16, 42, 80);   // #102A50
+    const COLORREF text = RGB(184, 243, 255);   // #B8F3FF
+    DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, &caption, sizeof(caption));
+    DwmSetWindowAttribute(hwnd, DWMWA_TEXT_COLOR, &text, sizeof(text));
+#endif
+}
+
 void MainWindow::keyPressEvent(QKeyEvent *event)
 {
     if (event->key() == Qt::Key_F11) {
@@ -333,7 +505,7 @@ void MainWindow::keyPressEvent(QKeyEvent *event)
         event->accept();
         return;
     }
-    const int count = 4;
+    const int count = 5;
     int index = static_cast<int>(currentPage());
     if (event->key() == Qt::Key_Right || event->key() == Qt::Key_PageDown) {
         navigateTo(static_cast<PageId>((index + 1) % count));
@@ -348,12 +520,50 @@ void MainWindow::keyPressEvent(QKeyEvent *event)
     QMainWindow::keyPressEvent(event);
 }
 
+void MainWindow::resizeEvent(QResizeEvent *event)
+{
+    QMainWindow::resizeEvent(event);
+    syncMapOverlayGeometry();
+}
+
+void MainWindow::syncMapOverlayGeometry()
+{
+    if (!m_pages) return;
+    // The map host and cover are siblings of the stacked widget. Keep both
+    // aligned to the post-layout page rectangle after fullscreen/windowed
+    // transitions, where a single resize event may precede layout activation.
+    const QRect pageRect = m_pages->geometry();
+    const bool routeActive = currentPage() == PageId::RoutePlanning;
+    QRect coverRect = pageRect;
+    // While leaving fullscreen, the hidden route page can still report its old
+    // full-screen map rectangle for one layout turn. Cover that stale rectangle
+    // too, so no WebEngine pixels can flash below the new windowed page bounds.
+    if (!routeActive && m_mapHost)
+        coverRect = coverRect.united(m_mapHost->geometry());
+    if (m_mapPrewarmCover)
+        m_mapPrewarmCover->setGeometry(coverRect);
+    if (m_mapHost)
+        m_mapHost->setGeometry(pageRect);
+    if (m_routePage)
+        m_routePage->syncMapHostGeometry();
+    if (!routeActive && m_mapHost && m_mapPrewarmCover) {
+        m_mapHost->lower();
+        m_mapPrewarmCover->show();
+        m_mapPrewarmCover->raise();
+        m_pages->raise();
+    }
+}
+
 void MainWindow::showEvent(QShowEvent *event)
 {
     QMainWindow::showEvent(event);
+    applyWindowChrome();
     EffectController::instance()->start();
     if (m_firstShow) {
         m_firstShow = false;
+        QTimer::singleShot(0, this, [this] {
+            if (m_routePage) m_routePage->warmUpMap();
+        });
         const bool windowed = QCoreApplication::arguments().contains(QStringLiteral("--windowed"));
         if (!windowed)
             QTimer::singleShot(0, this, [this] { showFullScreen(); });
@@ -373,6 +583,8 @@ void MainWindow::changeEvent(QEvent *event)
             EffectController::instance()->stop();
         else if (isVisible())
             EffectController::instance()->start();
+        QTimer::singleShot(0, this, [this] { syncMapOverlayGeometry(); });
+        QTimer::singleShot(50, this, [this] { syncMapOverlayGeometry(); });
     }
     QMainWindow::changeEvent(event);
 }

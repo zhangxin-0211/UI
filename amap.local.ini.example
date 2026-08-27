@@ -1,0 +1,9 @@
+; Copy this file to amap.local.ini next to UnderwaterMonitor.exe.
+; Do not commit amap.local.ini. Use credentials issued for AMap Web JS API 2.0.
+[AMap]
+JsApiKey=
+SecurityJsCode=
+; The map renders this fallback view immediately, then performs IP city location asynchronously.
+InitialLongitude=116.397
+InitialLatitude=39.908
+InitialZoom=5

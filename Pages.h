@@ -4,6 +4,8 @@
 #include <QWidget>
 
 #include "Actions.h"
+#include "CameraTypes.h"
+#include "LocationTypes.h"
 #include "RouteTypes.h"
 #include "TelemetryTypes.h"
 
@@ -22,6 +24,7 @@ class QDoubleSpinBox;
 class QComboBox;
 class QPushButton;
 class QTimer;
+class CameraController;
 
 class DashboardPage : public QWidget
 {
@@ -57,15 +60,33 @@ private:
 
 class RoutePage : public DashboardPage
 {
+    Q_OBJECT
 public:
     explicit RoutePage(DemoDataModel *model, QWidget *parent = nullptr);
+    void warmUpMap();
+    void setVehiclePosition(const RoutePoint &position);
+    void setCurrentLocation(const LocationFix &fix, LocationSource source);
+    void setLocationStatus(const QString &status);
+    void setPlannedPath(const RoutePath &path);
+    void setPageActive(bool active);
+    void setMapHost(QWidget *host);
+    void syncMapHostGeometry();
+
+signals:
+    void amapLocationReceived(const LocationFix &fix);
+    void amapLocationFailed(const QString &message);
 
 private:
     QVector<RoutePoint> routePointsFromTable() const;
+    void appendWaypointRow(const RoutePoint &point);
+    void updateWaypointRow(const RoutePoint &point);
+    void renumberWaypointRows();
     void syncMapWaypoints();
     MapPlanningWidget *m_mapPlanning = nullptr;
     LineChart *m_liveTrack = nullptr;
     QTableWidget *m_waypoints = nullptr;
+    int m_liveTrackUpdateDivider = 0;
+    bool m_pageActive = false;
 };
 
 class VideoPage : public DashboardPage
@@ -76,6 +97,16 @@ public:
 private:
     VideoPlaceholder *m_video = nullptr;
     QLabel *m_coordinates = nullptr;
+    QLabel *m_cameraInfo = nullptr;
+    QPushButton *m_playButton = nullptr;
+    QTimer *m_frameTimer = nullptr;
+    CameraController *m_cameraController = nullptr;
+};
+
+class SonarPage : public DashboardPage
+{
+public:
+    explicit SonarPage(QWidget *parent = nullptr);
 };
 
 class DataPage : public DashboardPage
