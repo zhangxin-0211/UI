@@ -43,3 +43,14 @@ outputs/
 *.pro.user
 CSV/
 *_recognition_result.png
+
+
+# 保留 Release 编译和运行需要的 OpenCV 文件
+third_party/opencv/x64/vc15/bin/*
+!third_party/opencv/x64/vc15/bin/opencv_world453.dll
+!third_party/opencv/x64/vc15/bin/opencv_videoio_msmf453_64.dll
+!third_party/opencv/x64/vc15/bin/opencv_videoio_ffmpeg453_64.dll
+
+third_party/opencv/x64/vc15/lib/*
+!third_party/opencv/x64/vc15/lib/opencv_world453.lib
+tests/target_wrapper.bat
