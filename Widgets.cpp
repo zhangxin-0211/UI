@@ -12,6 +12,7 @@
 #include <QJsonDocument>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QBuffer>
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QDir>
@@ -33,12 +34,52 @@
 #include <QtMath>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <limits>
 
 namespace {
 
 constexpr double kWebMercatorMaximumLatitude = 85.05112878;
-constexpr double kEarthCircumferenceMeters = 40075016.68557849;
 constexpr double kMapPi = 3.14159265358979323846;
+constexpr double kEquatorialMetersPerPixel = 156543.03392804097;
+
+struct ScaleRulerSpec {
+    double meters = 0.0;
+    int pixels = 0;
+    QString text;
+};
+
+ScaleRulerSpec scaleRulerFor(double latitudeDegrees, int zoom)
+{
+    const double metersPerPixel = kEquatorialMetersPerPixel
+        * std::cos(qDegreesToRadians(qBound(-kWebMercatorMaximumLatitude,
+                                             latitudeDegrees,
+                                             kWebMercatorMaximumLatitude)))
+        / std::pow(2.0, qMax(0, zoom));
+    if (!qIsFinite(metersPerPixel) || metersPerPixel <= 0.0) return {};
+
+    constexpr double desiredPixels = 132.0;
+    const double desiredMeters = desiredPixels * metersPerPixel;
+    const double magnitude = std::pow(10.0, std::floor(std::log10(desiredMeters)));
+    double meters = magnitude;
+    for (const double multiplier : {5.0, 2.0, 1.0}) {
+        const double candidate = multiplier * magnitude;
+        if (candidate <= desiredMeters) {
+            meters = candidate;
+            break;
+        }
+    }
+    const int pixels = qMax(36, qRound(meters / metersPerPixel));
+    QString text;
+    if (meters >= 1000.0) {
+        const double kilometers = meters / 1000.0;
+        text = QStringLiteral("%1 公里").arg(kilometers, 0, 'f',
+            std::abs(kilometers - std::round(kilometers)) < 1e-8 ? 0 : 1);
+    } else {
+        text = QStringLiteral("%1 米").arg(meters, 0, 'f', 0);
+    }
+    return {meters, pixels, text};
+}
 
 QPointF mercatorWorldPixel(const QPointF &coordinate, int zoom)
 {
@@ -100,6 +141,48 @@ QString amapConfigurationPath()
         if (QFileInfo::exists(candidate)) return QDir::cleanPath(candidate);
     }
     return candidates.first();
+}
+
+QString decodeEmbeddedCredential(const char *hex)
+{
+    const QByteArray encoded = QByteArray::fromHex(QByteArray(hex));
+    QByteArray decoded;
+    decoded.reserve(encoded.size());
+    for (const char byte : encoded)
+        decoded.append(char(static_cast<unsigned char>(byte) ^ 0x5A));
+    return QString::fromLatin1(decoded);
+}
+
+struct AmapConfigData
+{
+    QString key;
+    QString securityCode;
+    QPointF center{116.397, 39.908};
+    int zoom = 5;
+    QString source = QStringLiteral("CONFIG MISSING");
+};
+
+AmapConfigData loadAmapConfig()
+{
+    AmapConfigData config;
+    QSettings settings(amapConfigurationPath(), QSettings::IniFormat);
+    const QString externalKey = settings.value(QStringLiteral("AMap/JsApiKey"),
+                                                settings.value(QStringLiteral("AMap/Key"))).toString().trimmed();
+    const QString externalSecurity = settings.value(QStringLiteral("AMap/SecurityJsCode")).toString().trimmed();
+    config.center = QPointF(settings.value(QStringLiteral("AMap/InitialLongitude"), config.center.x()).toDouble(),
+                            settings.value(QStringLiteral("AMap/InitialLatitude"), config.center.y()).toDouble());
+    config.zoom = settings.value(QStringLiteral("AMap/InitialZoom"), config.zoom).toInt();
+    if (!externalKey.isEmpty() && !externalSecurity.isEmpty()) {
+        config.key = externalKey;
+        config.securityCode = externalSecurity;
+        config.source = QStringLiteral("EXTERNAL CONFIG");
+        return config;
+    }
+    config.key = decodeEmbeddedCredential("6A6269636D3E63623F633F693C6338396A3C6A68626B3B696A63383F6B626A6E");
+    config.securityCode = decodeEmbeddedCredential("62686D3F6F686A6F386F3F3B3E686A626F6C626F686B6D38383E633B62623C38");
+    if (!config.key.isEmpty() && !config.securityCode.isEmpty())
+        config.source = QStringLiteral("BUILT-IN FALLBACK");
+    return config;
 }
 
 QColor alpha(QColor color, int value)
@@ -598,23 +681,36 @@ MapPlanningWidget::MapPlanningWidget(QWidget *parent) : QWidget(parent)
     setMinimumSize(520, 360);
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     setMouseTracking(true);
-    QSettings settings(amapConfigurationPath(), QSettings::IniFormat);
-    m_jsApiKey = settings.value(QStringLiteral("AMap/JsApiKey"), settings.value(QStringLiteral("AMap/Key"))).toString();
-    m_securityJsCode = settings.value(QStringLiteral("AMap/SecurityJsCode")).toString();
-    m_centerCoordinate = QPointF(settings.value(QStringLiteral("AMap/InitialLongitude"), 116.397).toDouble(),
-                                 settings.value(QStringLiteral("AMap/InitialLatitude"), 39.908).toDouble());
+    const AmapConfigData amapConfig = loadAmapConfig();
+    m_jsApiKey = amapConfig.key;
+    m_securityJsCode = amapConfig.securityCode;
+    m_mapConfigSource = amapConfig.source;
+    m_centerCoordinate = amapConfig.center;
     m_cursorCoordinate = m_centerCoordinate;
-    m_zoom = settings.value(QStringLiteral("AMap/InitialZoom"), 5).toInt();
+    m_zoom = amapConfig.zoom;
     m_gridCenterCoordinate = m_centerCoordinate;
     m_gridZoom = qBound(1, m_zoom, 12);
     m_mapReady = false;
     m_mapStatus = m_jsApiKey.isEmpty() ? QStringLiteral("AMAP JS API · KEY REQUIRED")
-                                      : QStringLiteral("AMAP JS API · WAITING FOR WARM-UP");
+                                      : QStringLiteral("AMAP JS API · %1").arg(m_mapConfigSource);
 
     m_webSyncTimer = new QTimer(this);
     m_webSyncTimer->setSingleShot(true);
     m_webSyncTimer->setInterval(80);
     connect(m_webSyncTimer, &QTimer::timeout, this, &MapPlanningWidget::flushWebSync);
+    m_captureTimeoutTimer = new QTimer(this);
+    m_captureTimeoutTimer->setSingleShot(true);
+    m_captureTimeoutTimer->setInterval(2500);
+    connect(m_captureTimeoutTimer, &QTimer::timeout, this, [this] {
+        if (!m_capturePending) return;
+        m_capturePending = false;
+        if (m_webView) m_webView->page()->runJavaScript(QStringLiteral("restoreAfterWaterwayCapture();"));
+        refreshWaterwayOverlayView();
+        if (m_captureCoverView) m_captureCoverView->hide();
+        GeoReference reference;
+        reference.revision = m_mapRevision;
+        emit waterwayCaptureReady(QImage(), reference);
+    });
 
     m_recenterButton = new QPushButton(QStringLiteral("定位"), this);
     // 地图按钮使用独立尺寸和内边距，避免被全局 QPushButton 样式挤压中文。
@@ -630,7 +726,15 @@ MapPlanningWidget::MapPlanningWidget(QWidget *parent) : QWidget(parent)
         "QPushButton:pressed { background: #00D2FF; color: #050916; }"));
     m_recenterButton->setToolTip(QStringLiteral("回到当前位置"));
     connect(m_recenterButton, &QPushButton::clicked, this, [this] { centerOnCurrentLocation(); });
+    m_scaleRulerView = new QLabel(this);
+    m_scaleRulerView->setAttribute(Qt::WA_TransparentForMouseEvents, true);
+    m_scaleRulerView->setAttribute(Qt::WA_TranslucentBackground, true);
+    m_scaleRulerView->setAutoFillBackground(false);
+    m_scaleRulerView->setFixedSize(210, 56);
+    m_scaleRulerView->setToolTip(QStringLiteral("地图比例尺"));
+    m_scaleRulerView->hide();
     updateMapVisibility();
+    refreshScaleRulerView();
 }
 
 void MapPlanningWidget::warmUp()
@@ -639,7 +743,7 @@ void MapPlanningWidget::warmUp()
     m_warmupStarted = true;
 
     if (m_jsApiKey.trimmed().isEmpty()) {
-        m_mapStatus = QStringLiteral("AMAP JS API · KEY REQUIRED");
+        m_mapStatus = QStringLiteral("AMAP JS API · KEY REQUIRED · CONFIG MISSING");
         m_amapUnavailable = true;
         updateEffectiveMode();
         update();
@@ -671,33 +775,60 @@ void MapPlanningWidget::warmUp()
             [this](const QUrl &origin, QWebEnginePage::Feature feature) {
         if (feature == QWebEnginePage::Geolocation)
             m_webView->page()->setFeaturePermission(origin, feature,
-                                                     QWebEnginePage::PermissionGrantedByUser);
+                                                     QWebEnginePage::PermissionDeniedByUser);
     });
     m_webView->setGeometry(mapArea().toRect());
     m_webView->show();
+    // Keep the purple water film as a lightweight Qt overlay over the full map.
+    // Recognition temporarily switches this same map to its road-free feature set.
+    m_waterwayOverlayView = new QLabel(m_webViewHost ? m_webViewHost : this);
+    m_waterwayOverlayView->setAttribute(Qt::WA_TransparentForMouseEvents, true);
+    m_waterwayOverlayView->setAttribute(Qt::WA_TranslucentBackground, true);
+    m_waterwayOverlayView->setAutoFillBackground(false);
+    m_waterwayOverlayView->setStyleSheet(QStringLiteral("background: transparent;"));
+    m_waterwayOverlayView->setScaledContents(true);
+    m_waterwayOverlayView->hide();
+    // Hold the last fully rendered map frame over WebEngine while the temporary
+    // road-free frame is captured for recognition. This keeps the feature switch
+    // invisible to the user.
+    m_captureCoverView = new QLabel(m_webViewHost ? m_webViewHost : this);
+    m_captureCoverView->setAttribute(Qt::WA_TransparentForMouseEvents, true);
+    m_captureCoverView->setScaledContents(true);
+    m_captureCoverView->hide();
+    if (m_scaleRulerView) {
+        m_scaleRulerView->setParent(m_webViewHost ? m_webViewHost : this);
+        refreshScaleRulerView();
+    }
 
     m_bridge = new AmapWebBridge(m_webView);
     QWebChannel *channel = new QWebChannel(m_webView);
     channel->registerObject(QStringLiteral("bridge"), m_bridge);
     m_webView->page()->setWebChannel(channel);
     connect(m_bridge, &AmapWebBridge::waypointClicked, this, [this](double lon, double lat) {
-        RoutePoint point; point.id = QStringLiteral("map-%1").arg(m_nextWaypointId++);
-        point.coordinateSystem = CoordinateSystem::Wgs84;
-        point.position = GeoCoordinateUtils::gcj02ToWgs84(QPointF(lon, lat));
-        m_waypoints.append(point); emit waypointCreated(point); setWaypoints(m_waypoints);
+        if (!m_testDeviceSelectionEnabled && !m_targetSelectionEnabled) return;
+        RoutePoint point;
+        point.coordinateSystem = CoordinateSystem::Gcj02;
+        point.position = QPointF(lon, lat);
+        if (m_testDeviceSelectionEnabled) {
+            point.id = QStringLiteral("manual-test-device");
+            emit testDevicePositionSelected(point);
+            return;
+        }
+        point.id = QStringLiteral("mission-target");
+        setMissionTarget(point, TargetState::Pending);
+        emit missionTargetSelected(point);
     });
-    connect(m_bridge, &AmapWebBridge::waypointDragged, this, [this](const QString &id, double lon, double lat) {
-        for (RoutePoint &point : m_waypoints) if (point.id == id) { point.position = GeoCoordinateUtils::gcj02ToWgs84(QPointF(lon, lat)); point.coordinateSystem = CoordinateSystem::Wgs84; emit waypointUpdated(point); break; }
-    });
-    connect(m_bridge, &AmapWebBridge::waypointDeleteRequested, this, [this](const QString &id) { emit waypointRemoved(id); });
     connect(m_bridge, &AmapWebBridge::mapStateReported, this, [this](bool ready, const QString &message) {
         m_mapReady = ready;
         m_amapUnavailable = !ready;
         m_mapStatus = message;
         if (ready) {
-            m_waypointsDirty = true;
             m_plannedPathDirty = true;
             m_vehicleDirty = m_hasVehiclePosition;
+            m_actualVehicleDirty = m_hasActualVehiclePosition;
+            m_targetDirty = m_hasMissionTarget;
+            m_snapCandidateDirty = true;
+            m_planningStartDirty = true;
             m_locationDirty = m_currentLocation.valid;
             scheduleWebSync();
             if (m_pageActive && m_webView)
@@ -706,32 +837,75 @@ void MapPlanningWidget::warmUp()
             if (m_webView)
                 m_webView->page()->runJavaScript(QStringLiteral("setLocationActive(%1);")
                     .arg(m_pageActive ? QStringLiteral("true") : QStringLiteral("false")));
+            refreshWaterwayOverlayView();
         }
         updateEffectiveMode();
         update();
+        emit mapReadyChanged(ready);
     });
     connect(m_bridge, &AmapWebBridge::mapViewReported, this,
             [this](double longitude, double latitude, int zoom) {
-        m_centerCoordinate = GeoCoordinateUtils::gcj02ToWgs84(QPointF(longitude, latitude));
+        m_centerCoordinate = QPointF(longitude, latitude);
         m_cursorCoordinate = m_centerCoordinate;
         m_zoom = zoom;
+        refreshScaleRulerView();
         update();
+    });
+    connect(m_bridge, &AmapWebBridge::mapGeometryReported, this,
+            [this](double longitude, double latitude, int zoom, int width, int height,
+                   double topLeftLongitude, double topLeftLatitude,
+                   double bottomRightLongitude, double bottomRightLatitude,
+                   quint64 revision) {
+        m_centerCoordinate = QPointF(longitude, latitude);
+        m_viewTopLeftGcj02 = QPointF(topLeftLongitude, topLeftLatitude);
+        m_viewBottomRightGcj02 = QPointF(bottomRightLongitude, bottomRightLatitude);
+        m_zoom = zoom;
+        m_mapViewportPixels = QSize(width, height);
+        refreshScaleRulerView();
+        // JS revision values only describe map movements; Qt owns the public
+        // revision so resize and movement changes form one monotonic sequence.
+        if (revision != m_lastJsViewRevision) {
+            m_lastJsViewRevision = revision;
+            ++m_mapRevision;
+            emit mapRevisionChanged(m_mapRevision);
+        }
+    });
+    connect(m_bridge, &AmapWebBridge::capturePreparationReported, this,
+            [this](quint64 revision, double centerLongitude, double centerLatitude, int zoom,
+                   int width, int height, double topLeftLongitude, double topLeftLatitude,
+                   double bottomRightLongitude, double bottomRightLatitude) {
+        performWaterwayCapture(revision, centerLongitude, centerLatitude, zoom, width, height,
+                               topLeftLongitude, topLeftLatitude,
+                               bottomRightLongitude, bottomRightLatitude);
     });
     connect(m_bridge, &AmapWebBridge::amapLocationReported, this,
             [this](double longitude, double latitude, double accuracy, double altitude,
                    double timestampMs, const QString &detail) {
         LocationFix fix;
-        fix.wgs84Position = GeoCoordinateUtils::gcj02ToWgs84(QPointF(longitude, latitude));
+        fix.gcj02Position = QPointF(longitude, latitude);
         fix.horizontalAccuracyMeters = accuracy;
         fix.altitudeMeters = altitude;
         fix.timestamp = QDateTime::fromMSecsSinceEpoch(qRound64(timestampMs), Qt::UTC);
         if (!fix.timestamp.isValid()) fix.timestamp = QDateTime::currentDateTimeUtc();
         fix.providerDetail = detail;
-        fix.valid = GeoCoordinateUtils::isValidLongitudeLatitude(fix.wgs84Position);
+        fix.valid = GeoCoordinateUtils::isValidLongitudeLatitude(fix.gcj02Position);
         emit amapLocationReceived(fix);
+        if (m_manualLocationRequest) {
+            // Use the just-returned AMap fix immediately.  The controller also
+            // receives it through the signal above, but that signal is queued
+            // through the page hierarchy and should not delay manual recenter.
+            m_currentLocation = fix;
+            m_locationSource = LocationSource::Amap;
+            centerMapOnCurrentLocation();
+            finishManualLocationRequest(true);
+        }
     });
     connect(m_bridge, &AmapWebBridge::amapLocationFailureReported, this,
-            &MapPlanningWidget::amapLocationFailed);
+            [this](const QString &message) {
+        if (m_manualLocationRequest)
+            finishManualLocationRequest(false, message);
+        emit amapLocationFailed(message);
+    });
     connect(m_bridge, &AmapWebBridge::defaultMapRequested, this, [this] {
         if (m_webView)
             m_webView->page()->runJavaScript(QStringLiteral("startInitialMap(null);"));
@@ -756,15 +930,19 @@ void MapPlanningWidget::warmUp()
 
     const QString key = m_jsApiKey;
     const QString security = m_securityJsCode;
-    const QPointF initialAmapCenter = GeoCoordinateUtils::wgs84ToGcj02(m_centerCoordinate);
-    const QString html = QStringLiteral(R"HTML(
+    const QPointF initialAmapCenter = m_centerCoordinate;
+    // Split the embedded document into two literals. MSVC has a roughly 16K
+    // character limit for a single string literal; keeping each half below
+    // that limit also makes future HTML additions safe.
+    QString html = QStringLiteral(R"HTML(
 <!doctype html><html><head><meta charset="utf-8">
-<style>html,body,#map{margin:0;width:100%;height:100%;overflow:hidden;background:#071b38}#map .amap-marker,#map .amap-icon{cursor:move!important}#hud{display:none;position:absolute;left:16px;top:14px;z-index:10;padding:5px 9px;color:#d9f7ff;background:rgba(4,20,42,.86);border:1px solid rgba(0,210,255,.6);border-radius:4px;font:12px Arial;pointer-events:none}#startup{position:absolute;inset:0;z-index:30;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#06152b,#0a2850)}#startup-card{min-width:280px;padding:24px 32px;text-align:center;color:#d9f7ff;background:rgba(4,20,42,.9);border:1px solid #00d2ff;border-radius:9px;box-shadow:0 0 28px rgba(0,210,255,.2);font:14px Arial}#startup-title{font-weight:bold;letter-spacing:1px;color:#00f2fe;margin-bottom:10px}#startup-detail{font-size:12px;color:#8ec9e9;margin-bottom:16px}#skip-location{display:none;border:1px solid #00d2ff;border-radius:5px;padding:7px 16px;background:#123a70;color:#e4fbff;cursor:pointer;font-weight:bold}.location-dot{width:24px;height:24px;border:1px solid rgba(255,255,255,.88);border-radius:50%;background:rgba(52,120,246,.22);display:flex;align-items:center;justify-content:center;box-sizing:border-box;pointer-events:none}.location-dot-core{width:12px;height:12px;border:3px solid #fff;border-radius:50%;background:#3478f6;box-shadow:0 1px 4px rgba(0,0,0,.38);box-sizing:border-box}</style>
+ <style>html,body,#map-full{margin:0;width:100%;height:100%;overflow:hidden;background:#071b38}.map-layer{position:absolute;inset:0}.map-layer .amap-marker,.map-layer .amap-icon{cursor:move!important}#hud{display:none;position:absolute;left:16px;top:14px;z-index:25;padding:5px 9px;color:#d9f7ff;background:rgba(4,20,42,.86);border:1px solid rgba(0,210,255,.6);border-radius:4px;font:12px Arial;pointer-events:none}#startup{position:absolute;inset:0;z-index:30;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#06152b,#0a2850)}#startup-card{min-width:280px;padding:24px 32px;text-align:center;color:#d9f7ff;background:rgba(4,20,42,.9);border:1px solid #00d2ff;border-radius:9px;box-shadow:0 0 28px rgba(0,210,255,.2);font:14px Arial}#startup-title{font-weight:bold;letter-spacing:1px;color:#00f2fe;margin-bottom:10px}#startup-detail{font-size:12px;color:#8ec9e9;margin-bottom:16px}#skip-location{display:none;border:1px solid #00d2ff;border-radius:5px;padding:7px 16px;background:#123a70;color:#e4fbff;cursor:pointer;font-weight:bold}.location-dot{width:24px;height:24px;border:1px solid rgba(255,255,255,.88);border-radius:50%;background:rgba(52,120,246,.22);display:flex;align-items:center;justify-content:center;box-sizing:border-box;pointer-events:none}.location-dot-core{width:12px;height:12px;border:3px solid #fff;border-radius:50%;background:#3478f6;box-shadow:0 1px 4px rgba(0,0,0,.38);box-sizing:border-box}</style>
 <script>window._AMapSecurityConfig={securityJsCode:'%2'};</script>
 <script src="qrc:///qtwebchannel/qwebchannel.js"></script></head>
-<body><div id="map"></div><div id="hud">AMAP JS API · LOADING</div><div id="startup"><div id="startup-card"><div id="startup-title">正在获取当前位置</div><div id="startup-detail">地图将在定位完成后初始化</div><button id="skip-location" onclick="skipInitialLocation()">跳过定位，显示默认地图</button></div></div><script>
- var bridge=null,map=null,mapComplete=false,apiLoaded=false,apiLoading=false,apiAttempts=0,markers={},line=null,planned=null,vehicle=null,userLocation=null,geolocation=null;
- var hasVehicle=false,locationTimer=null,viewReportTimer=null,wheelTimer=null,wheelStartZoom=null,wheelDelta=0;
+ <body><div id="map-full" class="map-layer"></div><div id="hud">AMAP JS API · LOADING</div><div id="startup"><div id="startup-card"><div id="startup-title">正在初始化地图</div><div id="startup-detail">高德地图服务准备中…</div><button id="skip-location" onclick="skipInitialLocation()">跳过定位，显示默认地图</button></div></div><script>
+ var bridge=null,map=null,mapComplete=false,apiLoaded=false,apiLoading=false,apiAttempts=0,planned=null,vehicle=null,actualVehicle=null,userLocation=null,targetMarker=null,snapMarker=null,planningStartMarker=null,ipLocator=null,ipLocationApplied=false;
+ var hasVehicle=false,locationTimer=null,viewReportTimer=null;
+ var viewRevision=0,captureRevision=0;
  var initialMapStarted=false,initialViewLocked=false,initialLocationTimer=null,pendingInitialLocation=null,bootstrapLocation=null,locationPaused=false,mapSessionStarted=false;
  var stateReady=false,stateText='AMAP JS API · LOADING';
  function report(ok,msg){stateReady=ok;stateText=msg;var hud=document.getElementById('hud');hud.textContent=msg;hud.style.display=ok?'none':'block';if(bridge)bridge.mapStateChanged(ok,msg);}
@@ -772,39 +950,43 @@ void MapPlanningWidget::warmUp()
  function hideStartup(){var box=document.getElementById('startup');if(box)box.style.display='none';}
  function skipInitialLocation(){if(bridge)bridge.useDefaultMap();else startInitialMap(null);}
  window.onerror=function(msg){report(false,'JS ERROR · '+msg);};
- function clear(){if(!map)return;Object.keys(markers).forEach(function(k){map.remove(markers[k]);});markers={};if(line){map.remove(line);line=null;}}
- function sync(points){if(!map)return;clear();var path=[];points.forEach(function(p,i){var m=new AMap.Marker({position:[p.lon,p.lat],title:String(i+1),draggable:true,anchor:'center',offset:new AMap.Pixel(0,0),content:'<div style="width:18px;height:18px;box-sizing:border-box;border-radius:50%;background:#00d2ff;border:2px solid #fff;box-shadow:0 0 12px #00d2ff;color:#06152b;text-align:center;font:bold 11px Arial;line-height:14px">'+(i+1)+'</div>'});m.on('dragend',function(e){if(bridge)bridge.waypointMoved(p.id,e.lnglat.lng,e.lnglat.lat);});m.on('rightclick',function(){if(bridge)bridge.waypointDeleted(p.id);});m.setMap(map);markers[p.id]=m;path.push([p.lon,p.lat]);});if(path.length>1){line=new AMap.Polyline({path:path,strokeColor:'#00d2ff',strokeWeight:3,strokeOpacity:.8,strokeStyle:'dashed'});line.setMap(map);}}
  function setPlanned(points,valid){if(!map)return;if(planned){map.remove(planned);planned=null;}if(valid&&points.length>1){planned=new AMap.Polyline({path:points.map(function(p){return[p.lon,p.lat];}),strokeColor:'#a855f7',strokeWeight:4,strokeOpacity:.9});planned.setMap(map);}}
- function setVehicle(lon,lat,centerOnce){if(!map)return;var pos=[Number(lon),Number(lat)];if(!Number.isFinite(pos[0])||!Number.isFinite(pos[1]))return;hasVehicle=true;if(vehicle)vehicle.setPosition(pos);else{vehicle=new AMap.Marker({position:pos,title:'机器人位置'});vehicle.setMap(map);}}
- function reportView(){if(!map||!bridge)return;if(viewReportTimer)clearTimeout(viewReportTimer);viewReportTimer=setTimeout(function(){if(!map||!bridge)return;var c=map.getCenter();bridge.mapViewChanged(c.lng,c.lat,map.getZoom());},100);}
+ function setVehicle(lon,lat,heading){if(!map)return;var pos=[Number(lon),Number(lat)];if(!Number.isFinite(pos[0])||!Number.isFinite(pos[1]))return;hasVehicle=true;if(vehicle){vehicle.setPosition(pos);vehicle.setAngle(Number(heading)||0);}else{vehicle=new AMap.Marker({position:pos,title:'设备当前位置',anchor:'center',angle:Number(heading)||0,zIndex:520,content:'<div style="width:0;height:0;border-left:9px solid transparent;border-right:9px solid transparent;border-bottom:24px solid #ffb020;filter:drop-shadow(0 0 5px #ffb020);transform-origin:center"></div>'});vehicle.setMap(map);}}
+ function setActualVehicle(lon,lat,visible){if(!map)return;if(!visible){if(actualVehicle)actualVehicle.hide();return;}var pos=[Number(lon),Number(lat)];if(!Number.isFinite(pos[0])||!Number.isFinite(pos[1]))return;if(actualVehicle){actualVehicle.setPosition(pos);actualVehicle.show();return;}actualVehicle=new AMap.Marker({position:pos,title:'设备真实位置',anchor:'center',zIndex:521,content:'<div style="width:24px;height:24px;box-sizing:border-box;border-radius:50%;background:transparent;border:3px solid #ff334f;box-shadow:0 0 12px #ff334f"></div>'});actualVehicle.setMap(map);}
+ function setTarget(x,y,s){if(!map)return;var c={pending:'#7667ff',safe:'#20e3a2',invalid:'#ff334f'}[s]||'#7667ff',content='<div style="width:20px;height:20px;border-radius:50%;box-sizing:border-box;background:'+c+';border:3px solid #fff;box-shadow:0 0 13px '+c+'"></div>',pos=[+x,+y];if(targetMarker){targetMarker.setPosition(pos);targetMarker.setContent(content);targetMarker.show();return;}targetMarker=new AMap.Marker({position:pos,title:'任务目标',anchor:'center',zIndex:510,content:content});targetMarker.setMap(map);}
+ function clearTarget(){if(map&&targetMarker)map.remove(targetMarker);targetMarker=null;}
+ function setSnapCandidate(lon,lat,visible){if(!map)return;if(!visible){if(snapMarker)snapMarker.hide();return;}var pos=[Number(lon),Number(lat)];if(snapMarker){snapMarker.setPosition(pos);snapMarker.show();return;}snapMarker=new AMap.Marker({position:pos,title:'建议安全水域',anchor:'center',zIndex:509,content:'<div style="width:18px;height:18px;border-radius:50%;box-sizing:border-box;background:#ffd54a;border:3px solid #fff;box-shadow:0 0 12px #ffd54a"></div>'});snapMarker.setMap(map);}
+ function setPlanningStart(lon,lat,visible){if(map&&planningStartMarker){map.remove(planningStartMarker);planningStartMarker=null;}}
+ function mapGeometry(){if(!map)return null;var c=map.getCenter(),s=map.getSize();if(!c||!s||!Number.isFinite(Number(c.lng))||!Number.isFinite(Number(c.lat))||!Number.isFinite(Number(s.width))||!Number.isFinite(Number(s.height)))return null;var tl=map.containerToLngLat(new AMap.Pixel(0,0)),br=map.containerToLngLat(new AMap.Pixel(s.width,s.height));if(!tl||!br||!Number.isFinite(Number(tl.lng))||!Number.isFinite(Number(tl.lat))||!Number.isFinite(Number(br.lng))||!Number.isFinite(Number(br.lat)))return null;return{center:c,size:s,topLeft:tl,bottomRight:br};}
+ function reportView(changed){if(!map||!bridge)return;if(changed){viewRevision++;}if(viewReportTimer)clearTimeout(viewReportTimer);viewReportTimer=setTimeout(function(){if(!map||!bridge)return;var g=mapGeometry();if(!g)return;bridge.mapViewChanged(g.center.lng,g.center.lat,map.getZoom());bridge.mapGeometryChanged(g.center.lng,g.center.lat,map.getZoom(),g.size.width,g.size.height,g.topLeft.lng,g.topLeft.lat,g.bottomRight.lng,g.bottomRight.lat,viewRevision);},100);}
+ function showOperationalOverlays(show){[planned,vehicle,actualVehicle,userLocation,targetMarker,snapMarker,planningStartMarker].forEach(function(o){if(o){show?o.show():o.hide();}});}
+ function prepareWaterwayCapture(revision){if(!map||!mapComplete||!bridge)return;captureRevision=Number(revision)||viewRevision;showOperationalOverlays(false);map.setFeatures(['bg']);map.setStatus({showLabel:false,scrollWheel:false,zoomEnable:false,dragEnable:false,doubleClickZoom:false,keyboardEnable:false});map.resize();var notify=function(){requestAnimationFrame(function(){requestAnimationFrame(function(){if(!map||!bridge)return;var g=mapGeometry();if(!g)return;bridge.capturePrepared(captureRevision,g.center.lng,g.center.lat,map.getZoom(),g.size.width,g.size.height,g.topLeft.lng,g.topLeft.lat,g.bottomRight.lng,g.bottomRight.lat);});});};setTimeout(notify,120);}
+ function restoreAfterWaterwayCapture(){if(!map)return;map.setFeatures(['bg','road','point']);map.setStatus({showLabel:true,scrollWheel:true,zoomEnable:true,dragEnable:true,doubleClickZoom:true,keyboardEnable:true});showOperationalOverlays(true);}
  function reportLocation(result){if(!result||!result.position){if(bridge)bridge.locationFailed(result&&result.message?result.message:'POSITION UNAVAILABLE');return;}var pos=[Number(result.position.lng),Number(result.position.lat)];if(bridge)bridge.locationChanged(pos[0],pos[1],Number(result.accuracy||-1),Number(result.position.altitude||0),Date.now(),result.location_type||'AMAP');}
  function locationZoom(accuracy){return Number(accuracy)>5000?10:(Number(accuracy)>1000?12:(Number(accuracy)>200?14:16));}
  function setCurrentLocation(lon,lat,accuracy,centerOnce,sourceLabel){if(!map)return;var pos=[Number(lon),Number(lat)];if(!Number.isFinite(pos[0])||!Number.isFinite(pos[1]))return;if(userLocation){userLocation.setPosition(pos);}else{userLocation=new AMap.Marker({position:pos,title:'当前位置',anchor:'center',offset:new AMap.Pixel(0,0),zIndex:500,content:'<div class="location-dot"><div class="location-dot-core"></div></div>'});userLocation.setMap(map);}}
- // GPS can arrive while this document is merely being preloaded.  Cache the fix,
- // but never construct the map until the user has actually opened the route page.
  function setBootstrapLocation(lon,lat,accuracy){var pos=[Number(lon),Number(lat)];if(!Number.isFinite(pos[0])||!Number.isFinite(pos[1]))return;bootstrapLocation={pos:pos,accuracy:Number(accuracy)||-1};if(mapSessionStarted&&apiLoaded&&!initialMapStarted)startInitialMap(bootstrapLocation);}
- function setLocationActive(active){locationPaused=!active;if(active&&map)requestAmapLocation();}
- function requestAmapLocation(){if(!geolocation||locationPaused)return;geolocation.getCurrentPosition(function(status,result){if(status==='complete'&&result&&result.position)reportLocation(result);else if(bridge)bridge.locationFailed(result&&result.message?result.message:'AMAP LOCATION ERROR');});}
- function ensureGeolocation(callback){if(geolocation){callback(true);return;}AMap.plugin('AMap.Geolocation',function(){try{geolocation=new AMap.Geolocation({enableHighAccuracy:true,timeout:8000,maximumAge:10000,convert:true,showButton:false,needAddress:false,GeoLocationFirst:true,noIpLocate:0});callback(true);}catch(e){if(bridge)bridge.locationFailed(e.message||'AMAP LOCATION ERROR');callback(false);}});}
- function startLocationPolling(){if(locationTimer)return;locationTimer=setInterval(requestAmapLocation,15000);}
+ function setLocationActive(active){locationPaused=!active;if(active&&map)requestAmapLocation(false);}
+ function reportIpLocation(result,force){if(!result||!result.bounds||typeof result.bounds.getCenter!=='function'){if(bridge)bridge.locationFailed('AMAP IP LOCATION INVALID');return;}var center=result.bounds.getCenter();if(!center||!Number.isFinite(Number(center.lng))||!Number.isFinite(Number(center.lat))){if(bridge)bridge.locationFailed('AMAP IP LOCATION INVALID');return;}if(map&&(force||(!bootstrapLocation&&!ipLocationApplied))){map.setBounds(result.bounds,false);ipLocationApplied=true;}if(bridge)bridge.locationChanged(Number(center.lng),Number(center.lat),10000,0,Date.now(),'IP/'+String(result.city||result.province||'CITY'));}
+ function requestAmapLocation(force){if(!ipLocator||locationPaused)return;ipLocator.getLocalCity(function(status,result){if(status==='complete'&&result&&result.info==='OK')reportIpLocation(result,!!force);else if(bridge)bridge.locationFailed(result&&result.info?result.info:'AMAP IP LOCATION ERROR');});}
+ function ensureGeolocation(callback){if(ipLocator){callback(true);return;}AMap.plugin('AMap.CitySearch',function(){try{ipLocator=new AMap.CitySearch();callback(true);}catch(e){if(bridge)bridge.locationFailed(e.message||'AMAP IP LOCATION ERROR');callback(false);}});}
+ function startLocationPolling(){if(locationTimer)return;locationTimer=setInterval(function(){requestAmapLocation(false);},300000);}
  function startInitialMap(fix){if(initialMapStarted)return;initialMapStarted=true;if(initialLocationTimer){clearTimeout(initialLocationTimer);initialLocationTimer=null;}pendingInitialLocation=fix||null;var center=fix?fix.pos:[%3,%5];var zoom=fix?locationZoom(fix.accuracy):%4;createMap(center,zoom);}
- function beginInitialLocation(){if(bootstrapLocation){startInitialMap(bootstrapLocation);return;}showStartup('正在获取当前位置','高德定位服务准备中…',false);ensureGeolocation(function(available){if(initialMapStarted)return;if(!available||!geolocation){showStartup('定位服务不可用','请检查网络或点击跳过定位',true);return;}geolocation.getCurrentPosition(function(status,result){if(initialMapStarted)return;if(status==='complete'&&result&&result.position){var fix={pos:[Number(result.position.lng),Number(result.position.lat)],accuracy:Number(result.accuracy||-1)};reportLocation(result);startInitialMap(fix);}else{var message=result&&result.message?result.message:'定位未返回有效位置';if(bridge)bridge.locationFailed(message);showStartup('当前位置定位失败',message+'；可跳过定位后浏览默认地图',true);}});});}
+ function beginInitialLocation(){startInitialMap(bootstrapLocation||null);ensureGeolocation(function(available){if(!available||!ipLocator){if(bridge)bridge.locationFailed('AMAP IP LOCATION UNAVAILABLE');return;}requestAmapLocation(false);});}
  function enableMapInteraction(){if(!map)return;map.setStatus({scrollWheel:true,zoomEnable:true,dragEnable:true,doubleClickZoom:true,keyboardEnable:true});}
- function installWheelFallback(){var container=document.getElementById('map');container.addEventListener('wheel',function(e){if(!map)return;if(wheelStartZoom===null)wheelStartZoom=Number(map.getZoom());wheelDelta+=Number(e.deltaY||0);if(wheelTimer)clearTimeout(wheelTimer);wheelTimer=setTimeout(function(){if(!map){wheelStartZoom=null;wheelDelta=0;return;}var currentZoom=Number(map.getZoom());var initialZoom=Number(wheelStartZoom);var direction=wheelDelta<0?1:-1;wheelStartZoom=null;wheelDelta=0;if(currentZoom!==initialZoom)return;var nextZoom=Math.max(3,Math.min(20,initialZoom+direction));if(nextZoom===initialZoom)return;map.setZoom(nextZoom,false);reportView();},180);},{capture:true,passive:true});}
- // This is intentionally the only entry point that may start locating or create
- // AMap.Map.  The application calls it only after the route page is visible.
  function startMapSession(){if(mapSessionStarted)return;mapSessionStarted=true;if(typeof AMap!=='undefined'&&apiLoaded){beginInitialLocation();return;}loadAmapApi();}
- function activateMap(){if(!map){startMapSession();return;}enableMapInteraction();requestAnimationFrame(function(){if(!map)return;map.resize();reportView();});}
- function createMap(center,zoom){if(map)return;showStartup('正在初始化地图','地图服务正在后台准备…',false);try{map=new AMap.Map('map',{zoom:zoom,center:center,viewMode:'2D',animateEnable:false,resizeEnable:false,features:['bg','road','point'],pitchEnable:false,rotateEnable:false,jogEnable:false,buildingAnimation:false,scrollWheel:true,zoomEnable:true,dragEnable:true,doubleClickZoom:true,keyboardEnable:true});installWheelFallback();map.on('complete',function(){mapComplete=true;initialViewLocked=true;enableMapInteraction();if(pendingInitialLocation)setCurrentLocation(pendingInitialLocation.pos[0],pendingInitialLocation.pos[1],pendingInitialLocation.accuracy,false,'INITIAL');startLocationPolling();hideStartup();report(true,'AMAP JS API · ONLINE · INITIAL LOCATION READY');reportView();});map.on('click',function(e){if(bridge)bridge.mapClicked(e.lnglat.lng,e.lnglat.lat);});map.on('moveend',reportView);map.on('zoomend',reportView);setTimeout(function(){if(!mapComplete){report(false,'AMAP JS API · MAP LOAD SLOW');showStartup('地图加载较慢','请检查网络后重试',false);}},15000);}catch(e){report(false,'AMAP INIT FAILED · '+(e.message||e));showStartup('地图初始化失败',e.message||'AMAP INIT FAILED',false);}}
- // Script preload must not request location or allocate a map.  This avoids a
- // WebEngine/GPU composition spike several seconds after the program starts.
- function initMap(){apiLoaded=true;apiLoading=false;try{if(typeof AMap==='undefined')throw new Error('AMap object unavailable');if(mapSessionStarted)beginInitialLocation();else showStartup('地图组件已就绪','打开路径规划后开始定位与加载地图',false);}catch(e){report(false,'AMAP INIT FAILED · '+(e.message||e));}}
- function loadAmapApi(){if(typeof AMap!=='undefined'){initMap();return;}if(apiLoading)return;apiLoading=true;apiAttempts++;var api=document.createElement('script');api.async=true;api.src='https://webapi.amap.com/maps?v=2.0&key=%1&_attempt='+apiAttempts;api.onload=initMap;api.onerror=function(){apiLoading=false;report(false,'AMAP JS API · SCRIPT LOAD FAILED · RETRYING');if(apiAttempts<4)setTimeout(loadAmapApi,1200*apiAttempts);};document.head.appendChild(api);}
- if(typeof qt!=='undefined'&&typeof QWebChannel!=='undefined'){new QWebChannel(qt.webChannelTransport,function(c){bridge=c.objects.bridge;bridge.mapStateChanged(stateReady,stateText);});}
+ function activateMap(){if(!map){startMapSession();return;}enableMapInteraction();requestAnimationFrame(function(){if(!map)return;map.resize();reportView(false);});}
+)HTML") + QStringLiteral(R"HTML(
+function createMap(center,zoom){if(map)return;showStartup('正在初始化地图','地图服务正在后台准备…',false);try{map=new AMap.Map('map-full',{zoom:zoom,center:center,viewMode:'2D',animateEnable:false,resizeEnable:false,features:['bg','road','point'],pitchEnable:false,rotateEnable:false,jogEnable:false,buildingAnimation:false,scrollWheel:true,zoomEnable:true,dragEnable:true,doubleClickZoom:true,keyboardEnable:true});map.on('complete',function(){mapComplete=true;initialViewLocked=true;enableMapInteraction();if(pendingInitialLocation)setCurrentLocation(pendingInitialLocation.pos[0],pendingInitialLocation.pos[1],pendingInitialLocation.accuracy,false,'INITIAL');startLocationPolling();hideStartup();report(true,'AMAP JS API · ONLINE · MAP READY');reportView(false);});map.on('click',function(e){var point=e&&e.lnglat;if(bridge&&point&&Number.isFinite(Number(point.lng))&&Number.isFinite(Number(point.lat)))bridge.mapClicked(point.lng,point.lat);});map.on('moveend',function(){reportView(true);});map.on('zoomend',function(){reportView(true);});setTimeout(function(){if(!mapComplete){report(false,'AMAP JS API · MAP LOAD SLOW');showStartup('地图加载较慢','请检查网络后重试',false);}},15000);}catch(e){report(false,'AMAP INIT FAILED · '+(e.message||e));showStartup('地图初始化失败',e.message||'AMAP INIT FAILED',false);}}
+function initMap(){apiLoaded=true;apiLoading=false;try{if(typeof AMap==='undefined')throw new Error('AMap object unavailable');if(mapSessionStarted)beginInitialLocation();else showStartup('地图组件已就绪','打开路径规划后开始定位与加载地图',false);}catch(e){report(false,'AMAP INIT FAILED · '+(e.message||e));}}
+function loadAmapApi(){if(typeof AMap!=='undefined'){initMap();return;}if(apiLoading)return;apiLoading=true;apiAttempts++;var api=document.createElement('script');api.async=true;api.src='https://webapi.amap.com/maps?v=2.0&key=%1&_attempt='+apiAttempts;api.onload=initMap;api.onerror=function(){apiLoading=false;report(false,'AMAP JS API · SCRIPT LOAD FAILED · RETRYING');if(apiAttempts<4)setTimeout(loadAmapApi,1200*apiAttempts);};document.head.appendChild(api);}
+if(typeof qt!=='undefined'&&typeof QWebChannel!=='undefined'){new QWebChannel(qt.webChannelTransport,function(c){bridge=c.objects.bridge;bridge.mapStateChanged(stateReady,stateText);});}
 loadAmapApi();
 setTimeout(function(){if(!apiLoaded){apiLoading=false;report(false,'AMAP JS API · NETWORK SLOW · RETRYING');loadAmapApi();}},12000);
-</script></body></html>)HTML")
-        .arg(key.toHtmlEscaped()).arg(security.toHtmlEscaped()).arg(initialAmapCenter.x(),0,'f',6).arg(m_zoom).arg(initialAmapCenter.y(),0,'f',6);
+</script></body></html>)HTML");
+    html = html.arg(key.toHtmlEscaped()).arg(security.toHtmlEscaped())
+        .arg(initialAmapCenter.x(),0,'f',6).arg(m_zoom,0)
+        .arg(initialAmapCenter.y(),0,'f',6);
     m_webView->setHtml(html, QUrl(QStringLiteral("https://webapi.amap.com/")));
     updateMapVisibility();
     update();
@@ -825,6 +1007,7 @@ bool MapPlanningWidget::eventFilter(QObject *watched, QEvent *event)
 void MapPlanningWidget::resizeEvent(QResizeEvent *event)
 {
     QWidget::resizeEvent(event);
+    const QSize previousViewport = m_mapViewportPixels;
     if (m_webViewHost) {
         QWidget *hostParent = m_webViewHost->parentWidget();
         if (hostParent) {
@@ -837,6 +1020,25 @@ void MapPlanningWidget::resizeEvent(QResizeEvent *event)
     }
     if (m_recenterButton) m_recenterButton->setGeometry(width() - 140, 7, 104, 32);
     if (m_webViewHost) updateMapVisibility();
+    refreshWaterwayOverlayView();
+    refreshScaleRulerView();
+    const QSize currentViewport = mapArea().size().toSize();
+    // The first resize can happen before the asynchronous map-geometry report
+    // arrives.  Treat a newly observed valid viewport as a real change too;
+    // otherwise the automatic recognizer would remain pending until the user
+    // automatic recognition owns this capture; no manual recognition action is
+    // required from the user.
+    if (m_webView && currentViewport.isValid() && currentViewport != previousViewport) {
+        m_mapViewportPixels = currentViewport;
+        if (m_mapReady) {
+            ++m_mapRevision;
+            emit mapRevisionChanged(m_mapRevision);
+        }
+        // Keep this signal independent of map readiness.  A window can be
+        // resized while WebEngine is still loading; RoutePage will retain the
+        // pending request and run it as soon as the map reports ready.
+        emit mapViewportResized(m_mapRevision);
+    }
 }
 
 QRectF MapPlanningWidget::mapArea() const
@@ -846,35 +1048,26 @@ QRectF MapPlanningWidget::mapArea() const
 
 QPointF MapPlanningWidget::displayCoordinate(const RoutePoint &point) const
 {
-    return GeoCoordinateUtils::wgs84ToGcj02(waypointWgs84(point));
+    return waypointGcj02(point);
 }
 
-QPointF MapPlanningWidget::waypointWgs84(const RoutePoint &point) const
+QPointF MapPlanningWidget::waypointGcj02(const RoutePoint &point) const
 {
-    return point.coordinateSystem == CoordinateSystem::Gcj02
-        ? GeoCoordinateUtils::gcj02ToWgs84(point.position) : point.position;
-}
-
-void MapPlanningWidget::setWaypoints(const QVector<RoutePoint> &points)
-{
-    m_waypoints = points;
-    m_waypointsDirty = true;
-    update();
-    scheduleWebSync();
+    return point.position;
 }
 
 void MapPlanningWidget::setVehiclePosition(const RoutePoint &position)
 {
     RoutePoint acceptedPosition = position;
     if (acceptedPosition.coordinateSystem == CoordinateSystem::Unspecified)
-        acceptedPosition.coordinateSystem = CoordinateSystem::Wgs84;
+        acceptedPosition.coordinateSystem = CoordinateSystem::Gcj02;
     if (!GeoCoordinateUtils::isValidLongitudeLatitude(acceptedPosition.position)) {
         m_mapStatus = QStringLiteral("AMAP JS API · INVALID ROBOT POSITION · VIEW UNCHANGED");
         update();
         return;
     }
-    acceptedPosition.position = waypointWgs84(acceptedPosition);
-    acceptedPosition.coordinateSystem = CoordinateSystem::Wgs84;
+    acceptedPosition.position = waypointGcj02(acceptedPosition);
+    acceptedPosition.coordinateSystem = CoordinateSystem::Gcj02;
     m_vehiclePosition = acceptedPosition;
     m_hasVehiclePosition = true;
     m_vehicleDirty = true;
@@ -882,12 +1075,262 @@ void MapPlanningWidget::setVehiclePosition(const RoutePoint &position)
     scheduleWebSync();
 }
 
+void MapPlanningWidget::setVehicleTelemetry(const RoutePoint &position, double headingDegrees)
+{
+    m_vehicleHeadingDegrees = headingDegrees;
+    setVehiclePosition(position);
+}
+
+void MapPlanningWidget::setActualVehiclePosition(const RoutePoint &position)
+{
+    RoutePoint acceptedPosition = position;
+    if (acceptedPosition.coordinateSystem == CoordinateSystem::Unspecified)
+        acceptedPosition.coordinateSystem = CoordinateSystem::Gcj02;
+    m_hasActualVehiclePosition = GeoCoordinateUtils::isValidLongitudeLatitude(
+        acceptedPosition.position);
+    if (m_hasActualVehiclePosition) {
+        acceptedPosition.position = waypointGcj02(acceptedPosition);
+        acceptedPosition.coordinateSystem = CoordinateSystem::Gcj02;
+        m_actualVehiclePosition = acceptedPosition;
+    } else {
+        m_actualVehiclePosition = RoutePoint();
+    }
+    m_actualVehicleDirty = true;
+    update();
+    scheduleWebSync();
+}
+
+void MapPlanningWidget::setTargetSelectionEnabled(bool enabled)
+{
+    if (m_targetSelectionEnabled == enabled) return;
+    m_targetSelectionEnabled = enabled;
+    if (m_webView && m_mapReady)
+        m_webView->page()->runJavaScript(QStringLiteral(
+            "var mapElement=document.getElementById('map-full');"
+            "if(mapElement)mapElement.style.cursor='%1';")
+            .arg(m_testDeviceSelectionEnabled ? QStringLiteral("crosshair")
+                                              : QStringLiteral("default")));
+}
+
+void MapPlanningWidget::setTestDeviceSelectionEnabled(bool enabled)
+{
+    if (m_testDeviceSelectionEnabled == enabled) return;
+    m_testDeviceSelectionEnabled = enabled;
+    if (m_webView && m_mapReady)
+        m_webView->page()->runJavaScript(QStringLiteral(
+            "var mapElement=document.getElementById('map-full');"
+            "if(mapElement)mapElement.style.cursor='%1';")
+            .arg(enabled ? QStringLiteral("crosshair") : QStringLiteral("default")));
+}
+
+void MapPlanningWidget::setMissionTarget(const RoutePoint &target, TargetState state)
+{
+    m_missionTarget = target;
+    if (m_missionTarget.coordinateSystem == CoordinateSystem::Unspecified)
+        m_missionTarget.coordinateSystem = CoordinateSystem::Gcj02;
+    m_hasMissionTarget = GeoCoordinateUtils::isValidLongitudeLatitude(waypointGcj02(m_missionTarget));
+    m_targetState = state;
+    m_targetDirty = true;
+    scheduleWebSync();
+    update();
+}
+
+void MapPlanningWidget::setSnapCandidate(const RoutePoint &candidate, bool visible)
+{
+    m_snapCandidate = candidate;
+    if (m_snapCandidate.coordinateSystem == CoordinateSystem::Unspecified)
+        m_snapCandidate.coordinateSystem = CoordinateSystem::Gcj02;
+    m_hasSnapCandidate = visible
+        && GeoCoordinateUtils::isValidLongitudeLatitude(waypointGcj02(m_snapCandidate));
+    m_snapCandidateDirty = true;
+    scheduleWebSync();
+}
+
+void MapPlanningWidget::setPlanningStart(const RoutePoint &position, bool visible)
+{
+    m_planningStart = position;
+    if (m_planningStart.coordinateSystem == CoordinateSystem::Unspecified)
+        m_planningStart.coordinateSystem = CoordinateSystem::Gcj02;
+    m_hasPlanningStart = visible
+        && GeoCoordinateUtils::isValidLongitudeLatitude(waypointGcj02(m_planningStart));
+    m_planningStartDirty = true;
+    // The vehicle icon itself shows the effective start used by planning.
+    // m_vehiclePosition still retains the real telemetry coordinate.
+    if (m_hasVehiclePosition) m_vehicleDirty = true;
+    scheduleWebSync();
+    update();
+}
+
+void MapPlanningWidget::requestWaterwayCapture()
+{
+    // Capture a temporary road-free frame from the same map instance. The full
+    // presentation frame is covered while the feature set is switched.
+    if (!m_webView || !m_mapReady || m_capturePending) return;
+    m_capturePending = true;
+    if (m_captureCoverView) {
+        m_captureCoverView->setGeometry(m_webViewHost ? m_webViewHost->rect()
+                                                       : m_webView->geometry());
+        m_captureCoverView->setPixmap(m_webViewHost ? m_webViewHost->grab()
+                                                     : m_webView->grab());
+        m_captureCoverView->raise();
+        m_captureCoverView->show();
+    }
+    if (m_waterwayOverlayView) m_waterwayOverlayView->hide();
+    m_captureTimeoutTimer->start();
+    m_webView->page()->runJavaScript(QStringLiteral("prepareWaterwayCapture(%1);")
+        .arg(m_mapRevision));
+}
+
+void MapPlanningWidget::performWaterwayCapture(quint64 revision,
+                                                double centerLongitude,
+                                                double centerLatitude,
+                                                int zoom,
+                                                int width,
+                                                int height,
+                                                double topLeftLongitude,
+                                                double topLeftLatitude,
+                                                double bottomRightLongitude,
+                                                double bottomRightLatitude)
+{
+    if (!m_capturePending || !m_webView) return;
+    QTimer::singleShot(80, this, [this, revision, centerLongitude, centerLatitude, zoom,
+                                  width, height, topLeftLongitude, topLeftLatitude,
+                                  bottomRightLongitude, bottomRightLatitude] {
+        if (!m_webView) return;
+        m_captureTimeoutTimer->stop();
+        QImage image = m_webView->grab().toImage();
+        if (!image.isNull() && image.size() != m_webView->size())
+            image = image.scaled(m_webView->size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+        m_webView->page()->runJavaScript(QStringLiteral("restoreAfterWaterwayCapture();"));
+        m_capturePending = false;
+        refreshWaterwayOverlayView();
+        QTimer::singleShot(120, this, [this] {
+            if (m_captureCoverView) m_captureCoverView->hide();
+        });
+        GeoReference reference;
+        reference.centerGcj02 = QPointF(centerLongitude, centerLatitude);
+        reference.topLeftGcj02 = QPointF(topLeftLongitude, topLeftLatitude);
+        reference.bottomRightGcj02 = QPointF(bottomRightLongitude, bottomRightLatitude);
+        reference.zoom = zoom;
+        // The bridge reports the exact map viewport used for containerToLngLat.
+        // Keep the actual grab size as a final guard for device-pixel-ratio scaling.
+        reference.viewportPixels = QSize(width, height).isValid()
+            ? QSize(width, height) : image.size();
+        if (reference.viewportPixels != image.size())
+            reference.viewportPixels = image.size();
+        // Use the revision captured before JavaScript hid operational markers.
+        // If the map moves before grab() completes, RoutePage will reject this
+        // image instead of assigning stale pixels to the new map geometry.
+        reference.revision = revision;
+        emit waterwayCaptureReady(image, reference);
+    });
+}
+
+void MapPlanningWidget::setWaterwayOverlay(const QImage &overlay)
+{
+    if (overlay.isNull()) return;
+    m_waterwayOverlay = overlay;
+    refreshWaterwayOverlayView();
+}
+
+void MapPlanningWidget::setWaterwayOnlyMode(bool enabled)
+{
+    m_waterwayOnlyMode = enabled;
+    refreshWaterwayOverlayView();
+    update();
+}
+
+void MapPlanningWidget::clearWaterwayOverlay()
+{
+    m_waterwayOverlay = QImage();
+    refreshWaterwayOverlayView();
+}
+
+void MapPlanningWidget::refreshWaterwayOverlayView()
+{
+    if (!m_waterwayOverlayView) return;
+    const QImage &overlay = m_waterwayOverlay;
+    const bool visible = m_waterwayOnlyMode && !overlay.isNull()
+        && m_pageActive && m_webViewHost && m_mapReady;
+    if (!visible) {
+        m_waterwayOverlayView->hide();
+        return;
+    }
+    const QSize targetSize = m_webViewHost->size();
+    if (!targetSize.isValid()) {
+        m_waterwayOverlayView->hide();
+        return;
+    }
+    m_waterwayOverlayView->setGeometry(m_webViewHost->rect());
+    m_waterwayOverlayView->setPixmap(QPixmap::fromImage(
+        // The recognizer works on a bounded grid, but this is only the visual
+        // Keep the displayed film aligned to the exact recognition mask. The
+        // overlay is enlarged only for presentation and never used for math.
+        overlay.scaled(targetSize, Qt::IgnoreAspectRatio, Qt::FastTransformation)));
+    m_waterwayOverlayView->raise();
+    m_waterwayOverlayView->show();
+    if (m_scaleRulerView) m_scaleRulerView->raise();
+}
+
+void MapPlanningWidget::refreshScaleRulerView()
+{
+    if (!m_scaleRulerView) return;
+    QWidget *parent = m_webViewHost ? m_webViewHost : this;
+    const QRect area = m_webViewHost ? m_webViewHost->rect() : mapArea().toRect();
+    if (!m_pageActive || !parent || !area.isValid() || area.width() < 140
+        || area.height() < 100) {
+        m_scaleRulerView->hide();
+        return;
+    }
+    if (m_scaleRulerView->parentWidget() != parent)
+        m_scaleRulerView->setParent(parent);
+
+    const bool gridMode = m_effectiveMode == DisplayMode::GlobalGrid;
+    const ScaleRulerSpec ruler = scaleRulerFor(
+        (gridMode ? m_gridCenterCoordinate : m_centerCoordinate).y(),
+        gridMode ? m_gridZoom : m_zoom);
+    if (ruler.pixels <= 0 || ruler.text.isEmpty()) {
+        m_scaleRulerView->hide();
+        return;
+    }
+
+    QPixmap pixmap(m_scaleRulerView->size());
+    pixmap.fill(Qt::transparent);
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing);
+    const QRect textRect(0, 0, pixmap.width(), 28);
+    painter.setFont(Theme::font(11, true));
+    painter.setPen(QColor(255, 255, 255, 215));
+    painter.drawText(textRect.translated(1, 1), Qt::AlignCenter, ruler.text);
+    painter.setPen(QColor(5, 25, 50, 235));
+    painter.drawText(textRect, Qt::AlignCenter, ruler.text);
+
+    const int left = qBound(12, (pixmap.width() - ruler.pixels) / 2,
+                            pixmap.width() - 12);
+    const int right = qBound(left + 1, left + ruler.pixels, pixmap.width() - 12);
+    constexpr int baseline = 41;
+    painter.setPen(QPen(QColor(255, 255, 255, 210), 3.6));
+    painter.drawLine(left, baseline, right, baseline);
+    painter.drawLine(left, baseline - 4, left, baseline + 4);
+    painter.drawLine(right, baseline - 4, right, baseline + 4);
+    painter.setPen(QPen(QColor(5, 25, 50, 240), 1.3));
+    painter.drawLine(left, baseline, right, baseline);
+    painter.drawLine(left, baseline - 4, left, baseline + 4);
+    painter.drawLine(right, baseline - 4, right, baseline + 4);
+    painter.end();
+
+    m_scaleRulerView->setPixmap(pixmap);
+    m_scaleRulerView->move(area.left() + 12, area.bottom() - m_scaleRulerView->height() - 12);
+    m_scaleRulerView->raise();
+    m_scaleRulerView->show();
+}
+
 void MapPlanningWidget::setCurrentLocation(const LocationFix &fix, LocationSource source)
 {
     m_currentLocation = fix;
     m_locationSource = source;
-    if (fix.valid && GeoCoordinateUtils::isValidLongitudeLatitude(fix.wgs84Position)) {
-        m_cursorCoordinate = fix.wgs84Position;
+    if (fix.valid && GeoCoordinateUtils::isValidLongitudeLatitude(fix.gcj02Position)) {
+        m_cursorCoordinate = fix.gcj02Position;
         m_locationDirty = true;
         if (!m_mapReady) {
             m_bootstrapLocationDirty = true;
@@ -906,9 +1349,9 @@ void MapPlanningWidget::syncBootstrapLocation()
     // discard it and the first route-page session would unnecessarily use AMap.
     if (!m_bootstrapLocationDirty || !m_webView || !m_webPageLoaded || !m_currentLocation.valid)
         return;
-    if (!GeoCoordinateUtils::isInsideAmapCoverage(m_currentLocation.wgs84Position))
+    if (!GeoCoordinateUtils::isValidLongitudeLatitude(m_currentLocation.gcj02Position))
         return;
-    const QPointF gcj = GeoCoordinateUtils::wgs84ToGcj02(m_currentLocation.wgs84Position);
+    const QPointF gcj = m_currentLocation.gcj02Position;
     m_webView->page()->runJavaScript(QStringLiteral("setBootstrapLocation(%1,%2,%3);")
         .arg(gcj.x(), 0, 'f', 8)
         .arg(gcj.y(), 0, 'f', 8)
@@ -949,17 +1392,12 @@ void MapPlanningWidget::setPlannedPath(const RoutePath &path)
     scheduleWebSync();
 }
 
-void MapPlanningWidget::setMapReady(bool ready)
-{
-    m_mapReady = ready;
-    if (ready) scheduleWebSync();
-    update();
-}
-
 void MapPlanningWidget::setPageActive(bool active)
 {
     m_pageActive = active;
     updateMapVisibility();
+    refreshWaterwayOverlayView();
+    refreshScaleRulerView();
     if (m_webView && m_mapReady && m_amapLocationPaused == active) {
         m_amapLocationPaused = !active;
         m_webView->page()->runJavaScript(QStringLiteral("setLocationActive(%1);")
@@ -979,6 +1417,7 @@ void MapPlanningWidget::setWebViewHost(QWidget *host)
 {
     if (m_webViewHost == host) {
         updateMapVisibility();
+        refreshWaterwayOverlayView();
         return;
     }
     m_webViewHost = host;
@@ -987,13 +1426,27 @@ void MapPlanningWidget::setWebViewHost(QWidget *host)
         m_webView->setGeometry(m_webViewHost->rect());
         m_webView->show();
     }
+    if (m_waterwayOverlayView && m_webViewHost) {
+        m_waterwayOverlayView->setParent(m_webViewHost);
+        m_waterwayOverlayView->setGeometry(m_webViewHost->rect());
+    }
+    if (m_captureCoverView && m_webViewHost) {
+        m_captureCoverView->setParent(m_webViewHost);
+        m_captureCoverView->setGeometry(m_webViewHost->rect());
+    }
+    if (m_scaleRulerView && m_webViewHost)
+        m_scaleRulerView->setParent(m_webViewHost);
     updateMapVisibility();
+    refreshWaterwayOverlayView();
+    refreshScaleRulerView();
 }
 
 void MapPlanningWidget::syncWebViewGeometry()
 {
     if (m_webViewHost)
         updateMapVisibility();
+    refreshWaterwayOverlayView();
+    refreshScaleRulerView();
 }
 
 void MapPlanningWidget::updateEffectiveMode()
@@ -1017,6 +1470,7 @@ void MapPlanningWidget::updateMapVisibility()
         m_webViewHost->show();
         if (m_pageActive)
             m_webViewHost->raise();
+        refreshWaterwayOverlayView();
     }
     if (m_webView && !m_webViewHost) {
         // Keep the WebEngine child alive at its real size while the stacked page is
@@ -1038,38 +1492,67 @@ void MapPlanningWidget::updateMapVisibility()
         }
     }
     if (m_recenterButton) m_recenterButton->raise();
+    refreshScaleRulerView();
 }
 
 void MapPlanningWidget::centerOnCurrentLocation()
 {
-    if (!m_currentLocation.valid) {
-        m_locationStatus = QStringLiteral("LOCATION · NO VALID FIX");
+    if (m_manualLocationRequest) return;
+    if (!m_webView || !m_mapReady) {
+        m_locationStatus = QStringLiteral("LOCATION · MAP NOT READY");
         update();
         return;
     }
-    m_gridCenterCoordinate = m_currentLocation.wgs84Position;
-    m_locationCenterPending = true;
-    if (m_effectiveMode == DisplayMode::Amap && m_webView && m_mapReady) {
-        if (!GeoCoordinateUtils::isInsideAmapCoverage(m_currentLocation.wgs84Position)) {
-            m_locationStatus = QStringLiteral("LOCATION · OUTSIDE AMAP COVERAGE");
-            update();
-            return;
-        }
-        const QPointF gcj = GeoCoordinateUtils::wgs84ToGcj02(m_currentLocation.wgs84Position);
-        m_webView->page()->runJavaScript(QStringLiteral("map.setZoomAndCenter(15,[%1,%2],false);")
-            .arg(gcj.x(), 0, 'f', 8).arg(gcj.y(), 0, 'f', 8));
-        m_locationCenterPending = false;
+    if (m_currentLocation.valid
+        && GeoCoordinateUtils::isValidLongitudeLatitude(m_currentLocation.gcj02Position)) {
+        centerMapOnCurrentLocation();
+        return;
     }
+    m_manualLocationRequest = true;
+    m_recenterButton->setText(QStringLiteral("定位中…"));
+    m_recenterButton->setEnabled(false);
+    m_locationStatus = QStringLiteral("LOCATION · REQUESTING IP FIX");
+    m_webView->page()->runJavaScript(
+        QStringLiteral("if(typeof requestAmapLocation==='function')requestAmapLocation(true);"));
+    QTimer::singleShot(9000, this, [this] {
+        if (m_manualLocationRequest)
+            finishManualLocationRequest(false, QStringLiteral("定位请求超时"));
+    });
     update();
 }
 
-void MapPlanningWidget::clearOverlays()
+void MapPlanningWidget::centerMapOnCurrentLocation()
 {
-    m_waypoints.clear();
-    m_plannedPath = RoutePath();
-    m_waypointsDirty = true;
-    m_plannedPathDirty = true;
-    scheduleWebSync();
+    if (!m_currentLocation.valid || !m_webView || !m_mapReady) return;
+    m_gridCenterCoordinate = m_currentLocation.gcj02Position;
+    if (m_effectiveMode == DisplayMode::Amap) {
+        int zoom = 16;
+        const double accuracy = m_currentLocation.horizontalAccuracyMeters;
+        if (qIsFinite(accuracy) && accuracy > 5000.0) zoom = 10;
+        else if (qIsFinite(accuracy) && accuracy > 1000.0) zoom = 12;
+        else if (qIsFinite(accuracy) && accuracy > 200.0) zoom = 14;
+        const QPointF gcj = m_currentLocation.gcj02Position;
+        const QString script = QStringLiteral(
+            "if(typeof activateMap==='function')activateMap();"
+            "if(typeof map!=='undefined'&&map)map.setZoomAndCenter(%3,[%1,%2],false);")
+            .arg(gcj.x(), 0, 'f', 8)
+            .arg(gcj.y(), 0, 'f', 8)
+            .arg(zoom);
+        m_webView->page()->runJavaScript(script);
+    }
+}
+
+void MapPlanningWidget::finishManualLocationRequest(bool succeeded, const QString &message)
+{
+    if (!m_manualLocationRequest) return;
+    m_manualLocationRequest = false;
+    if (m_recenterButton) {
+        m_recenterButton->setText(QStringLiteral("定位"));
+        m_recenterButton->setEnabled(true);
+    }
+    if (!succeeded)
+        m_locationStatus = QStringLiteral("LOCATION · %1")
+            .arg(message.isEmpty() ? QStringLiteral("AMAP FAILED") : message);
     update();
 }
 
@@ -1084,24 +1567,6 @@ void MapPlanningWidget::flushWebSync()
     if (!m_mapReady || !m_webView) return;
 
     QString script;
-    if (m_waypointsDirty) {
-        QJsonArray array;
-        for (const RoutePoint &point : m_waypoints) {
-            const QPointF pos = displayCoordinate(point);
-            QJsonObject object;
-            object[QStringLiteral("id")] = point.id;
-            object[QStringLiteral("lon")] = pos.x();
-            object[QStringLiteral("lat")] = pos.y();
-            array.append(object);
-        }
-        const QString json = QString::fromUtf8(QJsonDocument(array).toJson(QJsonDocument::Compact));
-        if (json != m_lastWaypointsJson) {
-            script += QStringLiteral("sync(%1);").arg(json);
-            m_lastWaypointsJson = json;
-        }
-        m_waypointsDirty = false;
-    }
-
     if (m_plannedPathDirty) {
         QJsonArray array;
         for (const RoutePoint &point : m_plannedPath.points) {
@@ -1122,28 +1587,75 @@ void MapPlanningWidget::flushWebSync()
     }
 
     if (m_vehicleDirty && m_hasVehiclePosition) {
-        const QPointF wgs84 = waypointWgs84(m_vehiclePosition);
-        if (GeoCoordinateUtils::isInsideAmapCoverage(wgs84)) {
-            const QPointF pos = GeoCoordinateUtils::wgs84ToGcj02(wgs84);
+        const RoutePoint &displayedVehicle = m_hasPlanningStart
+            ? m_planningStart : m_vehiclePosition;
+        const QPointF pos = waypointGcj02(displayedVehicle);
+        if (GeoCoordinateUtils::isValidLongitudeLatitude(pos)) {
             script += QStringLiteral("setVehicle(%1,%2,%3);")
                 .arg(pos.x(), 0, 'f', 8)
                 .arg(pos.y(), 0, 'f', 8)
-                .arg(m_vehicleAutoCenterApplied ? QStringLiteral("false") : QStringLiteral("true"));
-            m_vehicleAutoCenterApplied = true;
+                .arg(m_vehicleHeadingDegrees, 0, 'f', 2);
         }
         m_vehicleDirty = false;
     }
 
+    if (m_actualVehicleDirty) {
+        if (m_hasActualVehiclePosition) {
+            const QPointF pos = waypointGcj02(m_actualVehiclePosition);
+            script += QStringLiteral("setActualVehicle(%1,%2,true);")
+                .arg(pos.x(), 0, 'f', 8).arg(pos.y(), 0, 'f', 8);
+        } else {
+            script += QStringLiteral("setActualVehicle(0,0,false);");
+        }
+        m_actualVehicleDirty = false;
+    }
+
+    if (m_targetDirty) {
+        if (m_hasMissionTarget) {
+            const QPointF pos = displayCoordinate(m_missionTarget);
+            QString stateName = QStringLiteral("pending");
+            if (m_targetState == TargetState::Safe) stateName = QStringLiteral("safe");
+            else if (m_targetState == TargetState::Invalid) stateName = QStringLiteral("invalid");
+            script += QStringLiteral("setTarget(%1,%2,'%3');")
+                .arg(pos.x(), 0, 'f', 8).arg(pos.y(), 0, 'f', 8)
+                .arg(stateName);
+        } else {
+            script += QStringLiteral("clearTarget();");
+        }
+        m_targetDirty = false;
+    }
+
+    if (m_snapCandidateDirty) {
+        if (m_hasSnapCandidate) {
+            const QPointF pos = displayCoordinate(m_snapCandidate);
+            script += QStringLiteral("setSnapCandidate(%1,%2,true);")
+                .arg(pos.x(), 0, 'f', 8).arg(pos.y(), 0, 'f', 8);
+        } else {
+            script += QStringLiteral("setSnapCandidate(0,0,false);");
+        }
+        m_snapCandidateDirty = false;
+    }
+
+    if (m_planningStartDirty) {
+        if (m_hasPlanningStart) {
+            const QPointF pos = displayCoordinate(m_planningStart);
+            script += QStringLiteral("setPlanningStart(%1,%2,true);")
+                .arg(pos.x(), 0, 'f', 8).arg(pos.y(), 0, 'f', 8);
+        } else {
+            script += QStringLiteral("setPlanningStart(0,0,false);");
+        }
+        m_planningStartDirty = false;
+    }
+
     if (m_locationDirty && m_currentLocation.valid) {
-        if (GeoCoordinateUtils::isInsideAmapCoverage(m_currentLocation.wgs84Position)) {
-            const QPointF pos = GeoCoordinateUtils::wgs84ToGcj02(m_currentLocation.wgs84Position);
+        if (GeoCoordinateUtils::isValidLongitudeLatitude(m_currentLocation.gcj02Position)) {
+            const QPointF pos = m_currentLocation.gcj02Position;
             script += QStringLiteral("setCurrentLocation(%1,%2,%3,%4,'%5');")
                 .arg(pos.x(), 0, 'f', 8)
                 .arg(pos.y(), 0, 'f', 8)
                 .arg(m_currentLocation.horizontalAccuracyMeters, 0, 'f', 2)
                 .arg(QStringLiteral("false"))
                 .arg(m_locationSource == LocationSource::Gps ? QStringLiteral("GPS") : QStringLiteral("AMAP"));
-            m_locationCenterPending = false;
         }
         m_locationDirty = false;
     }
@@ -1151,18 +1663,13 @@ void MapPlanningWidget::flushWebSync()
     if (!script.isEmpty()) m_webView->page()->runJavaScript(script);
 }
 
-void MapPlanningWidget::requestRoutePlanning()
-{
-    emit routePlanningRequested(m_waypoints);
-}
-
 QSize MapPlanningWidget::sizeHint() const { return QSize(980, 690); }
 
-QPointF MapPlanningWidget::gridProject(const QPointF &wgs84) const
+QPointF MapPlanningWidget::gridProject(const QPointF &gcj02) const
 {
     const QRectF area = mapArea();
     const QPointF centerPixel = mercatorWorldPixel(m_gridCenterCoordinate, m_gridZoom);
-    QPointF pointPixel = mercatorWorldPixel(wgs84, m_gridZoom);
+    QPointF pointPixel = mercatorWorldPixel(gcj02, m_gridZoom);
     const double worldSize = 256.0 * std::pow(2.0, m_gridZoom);
     double deltaX = pointPixel.x() - centerPixel.x();
     if (deltaX > worldSize * 0.5) deltaX -= worldSize;
@@ -1177,54 +1684,32 @@ QPointF MapPlanningWidget::gridUnproject(const QPointF &screenPosition) const
     return coordinateFromMercatorPixel(centerPixel + screenPosition - area.center(), m_gridZoom);
 }
 
-int MapPlanningWidget::waypointAt(const QPointF &position, qreal radius) const
-{
-    for (int i = m_waypoints.size() - 1; i >= 0; --i)
-        if (QLineF(gridProject(waypointWgs84(m_waypoints.at(i))), position).length() <= radius)
-            return i;
-    return -1;
-}
-
 void MapPlanningWidget::mousePressEvent(QMouseEvent *event)
 {
     if (m_effectiveMode != DisplayMode::GlobalGrid || !mapArea().contains(event->pos())) {
         QWidget::mousePressEvent(event);
         return;
     }
-    if (event->button() == Qt::RightButton) {
-        const int index = waypointAt(event->pos());
-        if (index >= 0) emit waypointRemoved(m_waypoints.at(index).id);
-        event->accept();
-        return;
-    }
     if (event->button() != Qt::LeftButton) return;
     m_gridPressPosition = event->pos();
     m_gridLastMousePosition = event->pos();
     m_gridMoved = false;
-    m_gridDraggedWaypoint = waypointAt(event->pos());
-    m_gridWaypointDragging = m_gridDraggedWaypoint >= 0;
-    m_gridDragging = !m_gridWaypointDragging;
-    setCursor(m_gridWaypointDragging ? Qt::ClosedHandCursor : Qt::SizeAllCursor);
+    m_gridDragging = true;
+    setCursor(Qt::SizeAllCursor);
     event->accept();
 }
 
 void MapPlanningWidget::mouseMoveEvent(QMouseEvent *event)
 {
     if (m_effectiveMode != DisplayMode::GlobalGrid) return QWidget::mouseMoveEvent(event);
-    if (!m_gridDragging && !m_gridWaypointDragging) {
+    if (!m_gridDragging) {
         m_cursorCoordinate = gridUnproject(event->pos());
-        const bool overWaypoint = waypointAt(event->pos()) >= 0;
-        setCursor(overWaypoint ? Qt::OpenHandCursor : Qt::ArrowCursor);
+        setCursor(Qt::ArrowCursor);
         update();
         return;
     }
     if (QLineF(m_gridPressPosition, event->pos()).length() > 3.0) m_gridMoved = true;
-    if (m_gridWaypointDragging && m_gridDraggedWaypoint >= 0 && m_gridDraggedWaypoint < m_waypoints.size()) {
-        RoutePoint &point = m_waypoints[m_gridDraggedWaypoint];
-        point.position = gridUnproject(event->pos());
-        point.coordinateSystem = CoordinateSystem::Wgs84;
-        emit waypointUpdated(point);
-    } else if (m_gridDragging) {
+    if (m_gridDragging) {
         const QPointF centerPixel = mercatorWorldPixel(m_gridCenterCoordinate, m_gridZoom);
         const QPoint delta = event->pos() - m_gridLastMousePosition;
         m_gridCenterCoordinate = coordinateFromMercatorPixel(centerPixel - QPointF(delta), m_gridZoom);
@@ -1239,19 +1724,23 @@ void MapPlanningWidget::mouseReleaseEvent(QMouseEvent *event)
 {
     if (m_effectiveMode != DisplayMode::GlobalGrid || event->button() != Qt::LeftButton)
         return QWidget::mouseReleaseEvent(event);
-    const bool addWaypoint = m_gridDragging && !m_gridMoved && mapArea().contains(event->pos());
+    const bool selectPoint = (m_testDeviceSelectionEnabled || m_targetSelectionEnabled)
+        && m_gridDragging && !m_gridMoved && mapArea().contains(event->pos());
     m_gridDragging = false;
-    m_gridWaypointDragging = false;
-    m_gridDraggedWaypoint = -1;
     unsetCursor();
-    if (addWaypoint) {
+    if (selectPoint) {
         RoutePoint point;
-        point.id = QStringLiteral("map-%1").arg(m_nextWaypointId++);
-        point.coordinateSystem = CoordinateSystem::Wgs84;
+        point.coordinateSystem = CoordinateSystem::Gcj02;
         point.position = gridUnproject(event->pos());
-        m_waypoints.append(point);
-        emit waypointCreated(point);
-        setWaypoints(m_waypoints);
+        if (m_testDeviceSelectionEnabled) {
+            point.id = QStringLiteral("manual-test-device");
+            emit testDevicePositionSelected(point);
+            event->accept();
+            return;
+        }
+        point.id = QStringLiteral("mission-target");
+        setMissionTarget(point, TargetState::Pending);
+        emit missionTargetSelected(point);
     }
     event->accept();
 }
@@ -1265,6 +1754,7 @@ void MapPlanningWidget::wheelEvent(QWheelEvent *event)
     const QPointF after = gridUnproject(event->position());
     m_gridCenterCoordinate += before - after;
     m_cursorCoordinate = before;
+    refreshScaleRulerView();
     update();
     event->accept();
 }
@@ -1308,33 +1798,37 @@ void MapPlanningWidget::drawGlobalGrid(QPainter &p, const QRectF &area)
         p.drawPolygon(screen);
     }
 
-    QVector<QPointF> waypointPositions;
-    for (const RoutePoint &point : m_waypoints) waypointPositions << gridProject(waypointWgs84(point));
-    if (waypointPositions.size() > 1) {
-        p.setPen(QPen(Theme::glow(), 2.5, Qt::DashLine, Qt::RoundCap, Qt::RoundJoin));
-        for (int i = 1; i < waypointPositions.size(); ++i)
-            p.drawLine(waypointPositions.at(i - 1), waypointPositions.at(i));
-    }
-    for (int i = 0; i < waypointPositions.size(); ++i) {
-        const QPointF pos = waypointPositions.at(i);
-        p.setPen(QPen(Qt::white, 2)); p.setBrush(Theme::glow());
-        p.drawEllipse(pos, 9, 9);
-        p.setPen(Theme::backgroundDeep()); p.setFont(Theme::font(7, true));
-        p.drawText(QRectF(pos.x() - 9, pos.y() - 9, 18, 18), Qt::AlignCenter, QString::number(i + 1));
-    }
-
     if (m_plannedPath.valid && m_plannedPath.points.size() > 1) {
         QPainterPath path;
         for (int i = 0; i < m_plannedPath.points.size(); ++i) {
-            const QPointF pos = gridProject(waypointWgs84(m_plannedPath.points.at(i)));
+            const QPointF pos = gridProject(waypointGcj02(m_plannedPath.points.at(i)));
             if (i == 0) path.moveTo(pos); else path.lineTo(pos);
         }
         p.setPen(QPen(Theme::plasmaViolet(), 3.5, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
         p.drawPath(path);
     }
 
+    if (m_hasMissionTarget) {
+        const QPointF pos = gridProject(waypointGcj02(m_missionTarget));
+        QColor color(118, 103, 255);
+        if (m_targetState == TargetState::Safe) color = QColor(32, 227, 162);
+        else if (m_targetState == TargetState::Invalid) color = QColor(255, 51, 79);
+        p.setPen(QPen(Qt::white, 3));
+        p.setBrush(color);
+        p.drawEllipse(pos, 10, 10);
+    }
+
+    if (m_hasSnapCandidate) {
+        const QPointF pos = gridProject(waypointGcj02(m_snapCandidate));
+        p.setPen(QPen(Qt::white, 3));
+        p.setBrush(QColor(255, 213, 74));
+        p.drawEllipse(pos, 9, 9);
+    }
+
     if (m_hasVehiclePosition) {
-        const QPointF pos = gridProject(waypointWgs84(m_vehiclePosition));
+        const RoutePoint &displayedVehicle = m_hasPlanningStart
+            ? m_planningStart : m_vehiclePosition;
+        const QPointF pos = gridProject(waypointGcj02(displayedVehicle));
         p.setPen(QPen(Theme::warning(), 2)); p.setBrush(alpha(Theme::warning(), 90));
         QPolygonF vehicleMark;
         vehicleMark << QPointF(pos.x(), pos.y() - 11) << QPointF(pos.x() + 8, pos.y() + 8)
@@ -1342,8 +1836,15 @@ void MapPlanningWidget::drawGlobalGrid(QPainter &p, const QRectF &area)
         p.drawPolygon(vehicleMark);
     }
 
+    if (m_hasActualVehiclePosition) {
+        const QPointF pos = gridProject(waypointGcj02(m_actualVehiclePosition));
+        p.setPen(QPen(Qt::white, 2.5));
+        p.setBrush(QColor(255, 51, 79));
+        p.drawEllipse(pos, 8, 8);
+    }
+
     if (m_currentLocation.valid) {
-        const QPointF pos = gridProject(m_currentLocation.wgs84Position);
+        const QPointF pos = gridProject(m_currentLocation.gcj02Position);
         p.setPen(QPen(Qt::white, 3));
         p.setBrush(m_locationSource == LocationSource::Gps ? Theme::value() : Theme::accent());
         p.drawEllipse(pos, 7, 7);
@@ -1352,7 +1853,7 @@ void MapPlanningWidget::drawGlobalGrid(QPainter &p, const QRectF &area)
     p.setPen(Theme::iceCyan());
     p.setFont(Theme::font(9, true));
     p.drawText(area.adjusted(14, 12, -14, -12), Qt::AlignLeft | Qt::AlignTop,
-               QStringLiteral("GLOBAL GRID · WGS-84 · Z%1").arg(m_gridZoom));
+               QStringLiteral("GLOBAL GRID · GCJ-02 · Z%1").arg(m_gridZoom));
     p.restore();
 }
 
@@ -1394,11 +1895,12 @@ void MapPlanningWidget::paintEvent(QPaintEvent *event)
                    m_jsApiKey.isEmpty() ? QStringLiteral("高德 JS API 等待授权配置")
                                         : QStringLiteral("高德地图后台加载中"));
         p.setFont(Theme::font(8)); p.setPen(Theme::textMuted());
-        p.drawText(message.adjusted(12, 42, -12, -7), Qt::AlignCenter, QStringLiteral("amap.local.ini · JsApiKey + SecurityJsCode"));
+        p.drawText(message.adjusted(12, 42, -12, -7), Qt::AlignCenter,
+                   QStringLiteral("amap.local.ini · Key + SecurityJsCode · %1").arg(m_mapConfigSource));
     }
     p.setFont(Theme::font(8)); p.setPen(Theme::textMuted());
     p.drawText(QRectF(20, height() - 29, width() - 40, 18), Qt::AlignLeft | Qt::AlignVCenter,
-               QStringLiteral("%1  ·  Z%2  ·  %3  ·  %4  ·  路径点顺序连线（非算法规划）  ·  %5")
+               QStringLiteral("%1  ·  Z%2  ·  %3  ·  %4  ·  单目标河道任务  ·  %5")
                    .arg(m_effectiveMode == DisplayMode::GlobalGrid ? QStringLiteral("GLOBAL GRID")
                                                                     : (m_mapReady ? QStringLiteral("AMAP JS API") : QStringLiteral("地图加载中")))
                    .arg(m_effectiveMode == DisplayMode::GlobalGrid ? m_gridZoom : m_zoom)

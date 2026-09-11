@@ -13,7 +13,7 @@ enum class LocationSource {
 };
 
 struct LocationFix {
-    QPointF wgs84Position;
+    QPointF gcj02Position;
     double horizontalAccuracyMeters = -1.0;
     double altitudeMeters = 0.0;
     QDateTime timestamp;

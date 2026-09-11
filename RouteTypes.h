@@ -7,16 +7,15 @@
 
 enum class CoordinateSystem {
     Unspecified,
-    Wgs84,
-    Gcj02,
-    LocalCartesian
+    Gcj02
 };
 
 struct RoutePoint {
     QString id;
-    CoordinateSystem coordinateSystem = CoordinateSystem::Unspecified;
+    CoordinateSystem coordinateSystem = CoordinateSystem::Gcj02;
     QPointF position;
-    double depth = 0.0;
+    double headingRadians = 0.0;
+    bool headingValid = false;
 };
 
 struct RoutePath {

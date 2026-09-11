@@ -3,6 +3,8 @@
 #include <QList>
 #include <QMainWindow>
 
+#include <memory>
+
 #include "Actions.h"
 #include "LocationTypes.h"
 #include "RouteTypes.h"
@@ -16,6 +18,8 @@ class DemoDataModel;
 class RoutePage;
 class QHideEvent;
 class QWidget;
+class IRoutePlanner;
+class IRobotProtocolCodec;
 
 class MainWindow : public QMainWindow
 {
@@ -33,10 +37,10 @@ public:
     explicit MainWindow(QWidget *parent = nullptr);
     void navigateTo(PageId page);
     PageId currentPage() const;
-    void setVehiclePosition(const RoutePoint &position);
-    void setPlannedPath(const RoutePath &path);
     void updateGpsLocation(const LocationFix &fix);
     void setGpsAvailable(bool available);
+    void setExternalRoutePlanner(const std::shared_ptr<IRoutePlanner> &planner);
+    void setRobotProtocolCodec(const std::shared_ptr<IRobotProtocolCodec> &codec);
 
 signals:
     void currentPageChanged(PageId page);

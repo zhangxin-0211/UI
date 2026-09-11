@@ -5,6 +5,8 @@
 #include "Pages.h"
 #include "Theme.h"
 #include "Widgets.h"
+#include "MissionTypes.h"
+#include "RoutePlanner.h"
 
 #include <QApplication>
 #include <QButtonGroup>
@@ -194,6 +196,18 @@ MainWindow::MainWindow(QWidget *parent)
     qRegisterMetaType<DeviceControlParameters>("DeviceControlParameters");
     qRegisterMetaType<LocationSource>("LocationSource");
     qRegisterMetaType<LocationFix>("LocationFix");
+    qRegisterMetaType<GeoReference>("GeoReference");
+    qRegisterMetaType<WaterwayGrid>("WaterwayGrid");
+    qRegisterMetaType<WaterwayRecognitionRequest>("WaterwayRecognitionRequest");
+    qRegisterMetaType<WaterwayRecognitionResult>("WaterwayRecognitionResult");
+    qRegisterMetaType<RoutePlanningRequest>("RoutePlanningRequest");
+    qRegisterMetaType<RoutePlanningResult>("RoutePlanningResult");
+    qRegisterMetaType<PreparedMission>("PreparedMission");
+    qRegisterMetaType<MissionState>("MissionState");
+    qRegisterMetaType<RobotTelemetry>("RobotTelemetry");
+    qRegisterMetaType<RobotLinkState>("RobotLinkState");
+    qRegisterMetaType<RobotEndpoint>("RobotEndpoint");
+    qRegisterMetaType<QVector<QVector<QPointF>>>("QVector<QVector<QPointF>>");
     setWindowTitle(QStringLiteral("水下清洁机器人智能监控系统"));
     setMinimumSize(1280, 720);
     resize(1600, 900);
@@ -210,6 +224,9 @@ MainWindow::MainWindow(QWidget *parent)
     QList<DashboardPage *> pageList;
     m_routePage = new RoutePage(m_model);
     m_locationController = new LocationController(this);
+    // Register the supplied Hybrid A* adapter for formal planning. The UI
+    // still gates sending until a real protocol codec is registered.
+    m_routePage->setExternalRoutePlanner(std::make_shared<HybridAstarRoutePlanner>());
     connect(m_routePage, &RoutePage::amapLocationReceived,
             m_locationController, &LocationController::updateAmapLocation);
     connect(m_routePage, &RoutePage::amapLocationFailed,
@@ -421,16 +438,6 @@ void MainWindow::navigateTo(PageId page)
     group->start();
 }
 
-void MainWindow::setVehiclePosition(const RoutePoint &position)
-{
-    if (m_routePage) m_routePage->setVehiclePosition(position);
-}
-
-void MainWindow::setPlannedPath(const RoutePath &path)
-{
-    if (m_routePage) m_routePage->setPlannedPath(path);
-}
-
 void MainWindow::updateGpsLocation(const LocationFix &fix)
 {
     if (m_locationController) m_locationController->updateGpsLocation(fix);
@@ -441,17 +448,24 @@ void MainWindow::setGpsAvailable(bool available)
     if (m_locationController) m_locationController->setGpsAvailable(available);
 }
 
+void MainWindow::setExternalRoutePlanner(const std::shared_ptr<IRoutePlanner> &planner)
+{
+    if (m_routePage) m_routePage->setExternalRoutePlanner(planner);
+}
+
+void MainWindow::setRobotProtocolCodec(const std::shared_ptr<IRobotProtocolCodec> &codec)
+{
+    if (m_routePage) m_routePage->setRobotProtocolCodec(codec);
+}
+
 void MainWindow::showActionHint(ActionId action)
 {
     QString name;
     QString state = QStringLiteral("功能接口已预留");
     switch (action) {
-    case ActionId::AddWaypoint: name = QStringLiteral("添加路径点"); break;
-    case ActionId::RemoveWaypoint: name = QStringLiteral("删除路径点"); break;
-    case ActionId::ClearWaypoints: name = QStringLiteral("清空路径点"); break;
-    case ActionId::LoadDefaults: name = QStringLiteral("载入默认参数"); break;
-    case ActionId::DrawRoute: name = QStringLiteral("绘制路径"); break;
-    case ActionId::SendMission: name = QStringLiteral("发送任务"); break;
+    case ActionId::AddWaypoint: name = QStringLiteral("设置任务目标"); break;
+    case ActionId::DrawRoute: name = QStringLiteral("规划任务路线"); break;
+    case ActionId::SendMission: name = QStringLiteral("上传任务路线"); break;
     case ActionId::StartVideo: name = QStringLiteral("摄像头控制"); state = QStringLiteral("状态已切换"); break;
     case ActionId::SendStationKeeping: name = QStringLiteral("悬停控制"); break;
     case ActionId::StartCollection: name = QStringLiteral("数据采集"); state = QStringLiteral("状态已切换"); break;
@@ -505,7 +519,11 @@ void MainWindow::keyPressEvent(QKeyEvent *event)
         event->accept();
         return;
     }
-    const int count = 5;
+    const int count = m_pages ? m_pages->count() : 0;
+    if (count <= 0) {
+        QMainWindow::keyPressEvent(event);
+        return;
+    }
     int index = static_cast<int>(currentPage());
     if (event->key() == Qt::Key_Right || event->key() == Qt::Key_PageDown) {
         navigateTo(static_cast<PageId>((index + 1) % count));

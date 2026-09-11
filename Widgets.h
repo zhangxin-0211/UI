@@ -13,6 +13,7 @@
 #include "ParticleSystem.h"
 #include "CameraTypes.h"
 #include "LocationTypes.h"
+#include "MissionTypes.h"
 #include "RouteTypes.h"
 
 class NeonPanel : public QFrame
@@ -138,29 +139,49 @@ class MapPlanningWidget : public QWidget
     Q_OBJECT
 
 public:
+    enum class TargetState {
+        Pending,
+        Safe,
+        Invalid
+    };
+
     explicit MapPlanningWidget(QWidget *parent = nullptr);
     void warmUp();
     bool isMapReady() const { return m_mapReady; }
-    void setWaypoints(const QVector<RoutePoint> &points);
+    QPointF currentMapCenter() const { return m_centerCoordinate; }
+    quint64 currentMapRevision() const { return m_mapRevision; }
     void setVehiclePosition(const RoutePoint &position);
+    void setVehicleTelemetry(const RoutePoint &position, double headingDegrees);
+    // Shows the unmodified telemetry/manual point separately from the safe
+    // planning point used by the orange vehicle marker.
+    void setActualVehiclePosition(const RoutePoint &position);
+    void setTargetSelectionEnabled(bool enabled);
+    void setTestDeviceSelectionEnabled(bool enabled);
+    void setMissionTarget(const RoutePoint &target, TargetState state = TargetState::Pending);
+    void setSnapCandidate(const RoutePoint &candidate, bool visible);
+    void setPlanningStart(const RoutePoint &position, bool visible);
+    void requestWaterwayCapture();
+    bool isWaterwayCapturePending() const { return m_capturePending; }
+    void setWaterwayOverlay(const QImage &overlay);
+    void clearWaterwayOverlay();
+    void setWaterwayOnlyMode(bool enabled);
     void setCurrentLocation(const LocationFix &fix, LocationSource source);
     void setLocationStatus(const QString &status);
     void setPlannedPath(const RoutePath &path);
-    void setMapReady(bool ready);
     void setPageActive(bool active);
     void setWebViewHost(QWidget *host);
     void syncWebViewGeometry();
-    void clearOverlays();
-    void requestRoutePlanning();
     QSize sizeHint() const override;
 
 signals:
-    void waypointCreated(const RoutePoint &point);
-    void waypointUpdated(const RoutePoint &point);
-    void waypointRemoved(const QString &id);
-    void routePlanningRequested(const QVector<RoutePoint> &points);
     void amapLocationReceived(const LocationFix &fix);
     void amapLocationFailed(const QString &message);
+    void missionTargetSelected(const RoutePoint &target);
+    void testDevicePositionSelected(const RoutePoint &position);
+    void waterwayCaptureReady(const QImage &image, const GeoReference &geoReference);
+    void mapRevisionChanged(quint64 revision);
+    void mapViewportResized(quint64 revision);
+    void mapReadyChanged(bool ready);
 
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override;
@@ -175,48 +196,66 @@ private:
     enum class DisplayMode { Amap, GlobalGrid };
 
     QRectF mapArea() const;
-    QPointF waypointWgs84(const RoutePoint &point) const;
+    QPointF waypointGcj02(const RoutePoint &point) const;
     QPointF displayCoordinate(const RoutePoint &point) const;
-    QPointF gridProject(const QPointF &wgs84) const;
+    QPointF gridProject(const QPointF &gcj02) const;
     QPointF gridUnproject(const QPointF &screenPosition) const;
     void drawGlobalGrid(QPainter &p, const QRectF &area);
     void updateEffectiveMode();
     void updateMapVisibility();
     void centerOnCurrentLocation();
-    int waypointAt(const QPointF &position, qreal radius = 14.0) const;
+    void centerMapOnCurrentLocation();
+    void finishManualLocationRequest(bool succeeded, const QString &message = QString());
     void scheduleWebSync();
     void flushWebSync();
     void syncBootstrapLocation();
     void startMapSession();
+    void performWaterwayCapture(quint64 revision,
+                                double centerLongitude, double centerLatitude, int zoom,
+                                int width, int height,
+                                double topLeftLongitude, double topLeftLatitude,
+                                double bottomRightLongitude, double bottomRightLatitude);
+    void refreshWaterwayOverlayView();
+    void refreshScaleRulerView();
 
-    QVector<RoutePoint> m_waypoints;
     RoutePath m_plannedPath;
     RoutePoint m_vehiclePosition;
+    RoutePoint m_actualVehiclePosition;
     LocationFix m_currentLocation;
     LocationSource m_locationSource = LocationSource::None;
     bool m_mapReady = false;
     bool m_amapUnavailable = false;
     bool m_hasVehiclePosition = false;
-    bool m_vehicleAutoCenterApplied = false;
+    bool m_hasActualVehiclePosition = false;
     bool m_warmupStarted = false;
     // Loading the WebEngine document is safe to do in the background.  Starting a
     // real AMap instance is deliberately deferred until the route page is visible.
     bool m_webPageLoaded = false;
     bool m_mapSessionRequested = false;
     bool m_mapSessionStarted = false;
-    bool m_waypointsDirty = true;
     bool m_plannedPathDirty = true;
     bool m_vehicleDirty = false;
+    bool m_actualVehicleDirty = false;
     bool m_locationDirty = false;
     bool m_bootstrapLocationDirty = false;
+    bool m_targetDirty = false;
+    bool m_snapCandidateDirty = false;
+    bool m_planningStartDirty = false;
     bool m_pageActive = false;
-    bool m_locationAutoCenterApplied = false;
-    bool m_locationCenterPending = false;
+    bool m_manualLocationRequest = false;
     bool m_gridDragging = false;
-    bool m_gridWaypointDragging = false;
     bool m_amapLocationPaused = false;
+    bool m_targetSelectionEnabled = false;
+    bool m_testDeviceSelectionEnabled = false;
+    bool m_waterwayOnlyMode = false;
+    QImage m_waterwayOverlay;
+    class QLabel *m_waterwayOverlayView = nullptr;
+    class QLabel *m_captureCoverView = nullptr;
+    class QLabel *m_scaleRulerView = nullptr;
+    QSize m_waterwayOverlayViewSize;
+    bool m_capturePending = false;
+    QTimer *m_captureTimeoutTimer = nullptr;
     bool m_gridMoved = false;
-    int m_gridDraggedWaypoint = -1;
     QPoint m_gridPressPosition;
     QPoint m_gridLastMousePosition;
     QPointF m_cursorCoordinate;
@@ -224,7 +263,22 @@ private:
     QPointF m_gridCenterCoordinate{116.397, 39.908};
     int m_zoom = 5;
     int m_gridZoom = 3;
-    int m_nextWaypointId = 1;
+    double m_vehicleHeadingDegrees = 0.0;
+    quint64 m_mapRevision = 0;
+    // JavaScript keeps its own lightweight view counter for pan/zoom events.
+    // Keep the last value separately so a Qt resize revision can never be
+    // overwritten by an older JS report.
+    quint64 m_lastJsViewRevision = 0;
+    QSize m_mapViewportPixels;
+    QPointF m_viewTopLeftGcj02;
+    QPointF m_viewBottomRightGcj02;
+    RoutePoint m_missionTarget;
+    RoutePoint m_snapCandidate;
+    RoutePoint m_planningStart;
+    bool m_hasMissionTarget = false;
+    TargetState m_targetState = TargetState::Pending;
+    bool m_hasSnapCandidate = false;
+    bool m_hasPlanningStart = false;
     class QWebEngineView *m_webView = nullptr;
     QWidget *m_webViewHost = nullptr;
     class AmapWebBridge *m_bridge = nullptr;
@@ -232,7 +286,7 @@ private:
     class QPushButton *m_recenterButton = nullptr;
     QString m_jsApiKey;
     QString m_securityJsCode;
-    QString m_lastWaypointsJson;
+    QString m_mapConfigSource = QStringLiteral("CONFIG MISSING");
     QString m_lastPlannedPathJson;
     QString m_mapStatus = QStringLiteral("AMAP JS API · LOADING");
     QString m_locationStatus = QStringLiteral("LOCATION · WAITING");
@@ -246,8 +300,6 @@ public:
     using QObject::QObject;
 public slots:
     void mapClicked(double longitude, double latitude) { emit waypointClicked(longitude, latitude); }
-    void waypointMoved(const QString &id, double longitude, double latitude) { emit waypointDragged(id, longitude, latitude); }
-    void waypointDeleted(const QString &id) { emit waypointDeleteRequested(id); }
     void mapStateChanged(bool ready, const QString &message) { emit mapStateReported(ready, message); }
     void mapViewChanged(double longitude, double latitude, int zoom) { emit mapViewReported(longitude, latitude, zoom); }
     void locationChanged(double longitude, double latitude, double accuracy, double altitude,
@@ -255,16 +307,39 @@ public slots:
     { emit amapLocationReported(longitude, latitude, accuracy, altitude, timestampMs, detail); }
     void locationFailed(const QString &message) { emit amapLocationFailureReported(message); }
     void useDefaultMap() { emit defaultMapRequested(); }
+    void mapGeometryChanged(double longitude, double latitude, int zoom, int width, int height,
+                            double topLeftLongitude, double topLeftLatitude,
+                            double bottomRightLongitude, double bottomRightLatitude,
+                            double revision)
+    { emit mapGeometryReported(longitude, latitude, zoom, width, height,
+                               topLeftLongitude, topLeftLatitude,
+                               bottomRightLongitude, bottomRightLatitude, quint64(revision)); }
+    void capturePrepared(double revision, double centerLongitude, double centerLatitude, int zoom,
+                         int width, int height,
+                         double topLeftLongitude, double topLeftLatitude,
+                         double bottomRightLongitude, double bottomRightLatitude)
+    {
+        emit capturePreparationReported(quint64(revision), centerLongitude, centerLatitude, zoom,
+                                        width, height, topLeftLongitude, topLeftLatitude,
+                                        bottomRightLongitude, bottomRightLatitude);
+    }
 signals:
     void waypointClicked(double longitude, double latitude);
-    void waypointDragged(const QString &id, double longitude, double latitude);
-    void waypointDeleteRequested(const QString &id);
     void mapStateReported(bool ready, const QString &message);
     void mapViewReported(double longitude, double latitude, int zoom);
     void amapLocationReported(double longitude, double latitude, double accuracy, double altitude,
                               double timestampMs, const QString &detail);
     void amapLocationFailureReported(const QString &message);
     void defaultMapRequested();
+    void mapGeometryReported(double longitude, double latitude, int zoom, int width, int height,
+                             double topLeftLongitude, double topLeftLatitude,
+                             double bottomRightLongitude, double bottomRightLatitude,
+                             quint64 revision);
+    void capturePreparationReported(quint64 revision,
+                                    double centerLongitude, double centerLatitude, int zoom,
+                                    int width, int height,
+                                    double topLeftLongitude, double topLeftLatitude,
+                                    double bottomRightLongitude, double bottomRightLatitude);
 };
 
 class VideoPlaceholder : public QWidget

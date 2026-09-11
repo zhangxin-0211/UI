@@ -4,9 +4,6 @@
 
 enum class ActionId {
     AddWaypoint,
-    RemoveWaypoint,
-    ClearWaypoints,
-    LoadDefaults,
     DrawRoute,
     SendMission,
     StartVideo,

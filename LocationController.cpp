@@ -11,8 +11,8 @@ bool sameFix(const LocationFix &first, const LocationFix &second)
 {
     if (first.valid != second.valid) return false;
     if (!first.valid) return true;
-    return qAbs(first.wgs84Position.x() - second.wgs84Position.x()) < 1e-9
-        && qAbs(first.wgs84Position.y() - second.wgs84Position.y()) < 1e-9
+    return qAbs(first.gcj02Position.x() - second.gcj02Position.x()) < 1e-9
+        && qAbs(first.gcj02Position.y() - second.gcj02Position.y()) < 1e-9
         && qAbs(first.horizontalAccuracyMeters - second.horizontalAccuracyMeters) < 0.01
         && first.timestamp == second.timestamp
         && first.providerDetail == second.providerDetail;
@@ -42,7 +42,7 @@ void LocationController::updateGpsLocation(const LocationFix &fix)
     if (!m_gpsFix.timestamp.isValid())
         m_gpsFix.timestamp = QDateTime::currentDateTimeUtc();
     m_gpsFix.valid = m_gpsFix.valid
-        && GeoCoordinateUtils::isValidLongitudeLatitude(m_gpsFix.wgs84Position);
+        && GeoCoordinateUtils::isValidLongitudeLatitude(m_gpsFix.gcj02Position);
     if (m_gpsFix.valid) m_gpsAvailable = true;
     evaluate();
 }
@@ -59,7 +59,7 @@ void LocationController::updateAmapLocation(const LocationFix &fix)
     if (!m_amapFix.timestamp.isValid())
         m_amapFix.timestamp = QDateTime::currentDateTimeUtc();
     m_amapFix.valid = m_amapFix.valid
-        && GeoCoordinateUtils::isValidLongitudeLatitude(m_amapFix.wgs84Position);
+        && GeoCoordinateUtils::isValidLongitudeLatitude(m_amapFix.gcj02Position);
     if (m_amapFix.valid) m_lastAmapError.clear();
     evaluate();
 }
