@@ -411,7 +411,10 @@ RoutePage::RoutePage(DemoDataModel *model, QWidget *parent) : DashboardPage(pare
     m_targetPositionLabel = label(QStringLiteral("目标位置：尚未设置（单击地图即可设置）"), 9, true);
     m_recognitionStatusLabel = label(QStringLiteral("河道识别：尚未识别"), 9);
     m_missionStatusLabel = label(QStringLiteral("任务状态：未就绪"), 9, true);
-    m_algorithmStatusLabel = label(QStringLiteral("算法：原始 Hybrid A* · 离岸 5 m · 障碍点间距 4 m"), 8);
+    m_algorithmStatusLabel = label(
+        QStringLiteral("算法：原始 Hybrid A* · 离岸 %1 m · 障碍点间距 %2 m")
+            .arg(suppliedHybridAstarParameters().shoreSafetyMeters, 0, 'f', 0)
+            .arg(suppliedHybridAstarParameters().boundaryPointSpacingMeters, 0, 'f', 0), 8);
     m_planningDiagnosticsLabel = label(QStringLiteral("规划诊断：等待规划"), 8);
     const QList<QLabel *> taskLabels = {m_devicePositionLabel, m_targetPositionLabel,
                                         m_recognitionStatusLabel, m_missionStatusLabel,
@@ -721,18 +724,23 @@ RoutePage::RoutePage(DemoDataModel *model, QWidget *parent) : DashboardPage(pare
         // that will be handed to the device protocol once it is connected.
         const int outboundPointCount = m_preparedMission.outboundRoute.points.size();
         m_algorithmStatusLabel->setText(
-            QStringLiteral("算法：%1 · 离岸 5 m · 障碍点间距 4 m · 待发送路径点 %2 个")
-                .arg(result.algorithmId).arg(outboundPointCount));
+            QStringLiteral("算法：%1 · 离岸 %2 m · 障碍点间距 %3 m · 待发送路径点 %4 个")
+                .arg(result.algorithmId)
+                .arg(suppliedHybridAstarParameters().shoreSafetyMeters, 0, 'f', 0)
+                .arg(suppliedHybridAstarParameters().boundaryPointSpacingMeters, 0, 'f', 0)
+                .arg(outboundPointCount));
         emit missionPrepared(m_preparedMission);
-        setMissionState(MissionState::Planned,
-                        QStringLiteral("任务数据已准备，等待 UDP 协议接入"));
+        setMissionState(MissionState::Planned, preparedMissionAvailabilityMessage());
     });
 
     connect(m_udpController, &UdpRobotController::linkStateChanged, this,
             [this](RobotLinkState state, const QString &message) {
         Q_UNUSED(state);
         Q_UNUSED(message);
-        updateControls();
+        if (m_missionState == MissionState::Planned && m_preparedMission.valid)
+            setMissionState(MissionState::Planned, preparedMissionAvailabilityMessage());
+        else
+            updateControls();
     });
     connect(m_udpController, &UdpRobotController::telemetryReceived, this,
             [this](const RobotTelemetry &telemetry) {
@@ -766,16 +774,19 @@ RoutePage::RoutePage(DemoDataModel *model, QWidget *parent) : DashboardPage(pare
             // Re-run only the start-cell check when telemetry becomes fresh;
             // do not require the user to press “确认水域” a second time.
             confirmWaterway();
-        } else
+        } else if (m_missionState == MissionState::Planned && m_preparedMission.valid) {
+            setMissionState(MissionState::Planned, preparedMissionAvailabilityMessage());
+        } else {
             updateControls();
+        }
     });
     connect(m_udpController, &UdpRobotController::routeUploaded, this,
             [this](const QString &) {
         m_routeUploaded = true;
         setMissionState(m_returning ? MissionState::Returning : MissionState::Executing,
                         m_returning
-                            ? QStringLiteral("返航路线、真实起点和目标已上传，正在自动启动返航")
-                            : QStringLiteral("路线、真实起点和目标已上传，正在自动启动设备"));
+                            ? QStringLiteral("返航路线已单次 UDP 发送，等待设备返航遥测")
+                            : QStringLiteral("巡线路线 UDP 包已发出，等待设备执行遥测"));
     });
     connect(m_udpController, &UdpRobotController::commandAcknowledged, this,
             [this](const QString &command, const QString &) {
@@ -994,7 +1005,9 @@ void RoutePage::setExternalRoutePlanner(const std::shared_ptr<IRoutePlanner> &pl
     if (m_plannerController) m_plannerController->setExternalPlanner(planner);
     if (m_algorithmStatusLabel) {
         m_algorithmStatusLabel->setText(planner
-            ? QStringLiteral("算法：原始 Hybrid A* · 离岸 5 m · 障碍点间距 4 m")
+            ? QStringLiteral("算法：原始 Hybrid A* · 离岸 %1 m · 障碍点间距 %2 m")
+                  .arg(suppliedHybridAstarParameters().shoreSafetyMeters, 0, 'f', 0)
+                  .arg(suppliedHybridAstarParameters().boundaryPointSpacingMeters, 0, 'f', 0)
             : QStringLiteral("算法：原始 Hybrid A* 未接入，无法规划"));
     }
     updateControls();
@@ -1045,7 +1058,7 @@ void RoutePage::updateControls()
     m_uploadButton->setEnabled(missionReady && taskEditingAllowed);
     m_uploadButton->setToolTip(missionProtocolReady
         ? (linkReady
-            ? (telemetryReady ? QStringLiteral("上传路线、真实起点和目标后自动启动设备")
+            ? (telemetryReady ? QStringLiteral("发送 0x01 巡线路线包")
                               : QStringLiteral("等待设备位置与艏向遥测"))
             : QStringLiteral("等待设备双向心跳连接"))
         : QStringLiteral("等待设备 UDP 协议接入"));
@@ -1071,6 +1084,17 @@ bool RoutePage::hasUsableDeviceOrigin() const
         && m_lastTelemetry.valid && m_lastTelemetry.headingValid
         && qIsFinite(m_lastTelemetry.headingDegrees)
         && GeoCoordinateUtils::isValidLongitudeLatitude(m_lastTelemetry.gcj02Position);
+}
+
+QString RoutePage::preparedMissionAvailabilityMessage() const
+{
+    if (!m_udpController || !m_udpController->hasMissionProtocolCodec())
+        return QStringLiteral("任务数据已准备，等待下发协议接入");
+    if (!m_udpController->isLinkEstablished())
+        return QStringLiteral("任务数据已准备，等待设备有效 UDP 报文以建立连接");
+    if (!m_udpController->isTelemetryFresh())
+        return QStringLiteral("任务数据已准备，等待 5 秒内的设备位置与艏向遥测");
+    return QStringLiteral("任务数据已准备，可点击“上传路线”发送 0x01 巡线路径包");
 }
 
 double RoutePage::activeDeviceHeadingDegrees() const
@@ -1345,7 +1369,7 @@ QPoint RoutePage::nearestSafeCell(const QPoint &origin, int requiredRegion,
     const QVector<QPointF> obstaclePoints = buildWaterwayObstaclePoints(obstacleRequest);
     if (obstaclePoints.isEmpty()) return QPoint(-1, -1);
     const double minimumClearance = qMax(suppliedHybridAstarParameters().shoreSafetyMeters + 1.0,
-                                         6.0);
+                                         4.0);
     for (const Candidate &candidate : candidates) {
         if (m_waterwayGrid.connectedRegionIds.at(candidate.cell.y() * width + candidate.cell.x())
                 != plannerRegion)

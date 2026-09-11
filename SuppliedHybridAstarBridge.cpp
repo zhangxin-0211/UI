@@ -22,8 +22,8 @@
 namespace {
 
 constexpr double kPi = 3.14159265358979323846;
-constexpr double kSuppliedShoreSafetyMeters = 5.0;
-constexpr double kBoundarySpacingMeters = 4.0;
+constexpr double kSuppliedShoreSafetyMeters = 3.0;
+constexpr double kBoundarySpacingMeters = 2.0;
 constexpr double kSuppliedWorldLimitMeters = 5000.0;
 static_assert(kBoundarySpacingMeters < kSuppliedShoreSafetyMeters,
               "Shoreline obstacle samples must be closer than the safety radius");

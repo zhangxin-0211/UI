@@ -22,12 +22,12 @@ void writeBigEndianU16(QByteArray &data, int offset, quint16 value)
     data[offset + 1] = char(value & 0xff);
 }
 
-QByteArray telemetryFrame(quint32 longitude, quint32 latitude, quint16 heading)
+QByteArray telemetryFrame(quint32 latitude, quint32 longitude, quint16 heading)
 {
     QByteArray frame(15, '\0');
     frame[0] = char(0x55); frame[1] = char(0x55);
-    writeBigEndianU32(frame, 2, longitude);
-    writeBigEndianU32(frame, 6, latitude);
+    writeBigEndianU32(frame, 2, latitude);
+    writeBigEndianU32(frame, 6, longitude);
     writeBigEndianU16(frame, 10, heading);
     uchar checksum = 0;
     for (int i = 0; i < 12; ++i) checksum = uchar(checksum + uchar(frame.at(i)));
@@ -46,6 +46,7 @@ private slots:
     void acceptsTelemetry();
     void rejectsMalformedFrames();
     void sendsPeriodicHeartbeat();
+    void encodesDirectRouteCommands();
 };
 
 void DeviceTelemetryProtocolTest::acceptsHeartbeat()
@@ -67,7 +68,7 @@ void DeviceTelemetryProtocolTest::acceptsTelemetry()
     QString type, missionId;
     int sequence = 0;
     RobotTelemetry telemetry;
-    const QByteArray frame = telemetryFrame(1134903745u, 221500000u, 12345u);
+    const QByteArray frame = telemetryFrame(221500000u, 1134903745u, 12345u);
     QVERIFY(codec.decodeMessage(frame, &type, &missionId, &sequence, &telemetry));
     QCOMPARE(type, QStringLiteral("telemetry"));
     QVERIFY(telemetry.valid);
@@ -83,17 +84,17 @@ void DeviceTelemetryProtocolTest::rejectsMalformedFrames()
     QString type, missionId;
     int sequence = -1;
     RobotTelemetry telemetry;
-    QByteArray frame = telemetryFrame(1134903745u, 221500000u, 12345u);
+    QByteArray frame = telemetryFrame(221500000u, 1134903745u, 12345u);
     frame[12] = char(uchar(frame.at(12)) + 1);
     QVERIFY(!codec.decodeMessage(frame, &type, &missionId, &sequence, &telemetry));
-    frame = telemetryFrame(1134903745u, 221500000u, 12345u);
+    frame = telemetryFrame(221500000u, 1134903745u, 12345u);
     frame[13] = '\0';
     QVERIFY(!codec.decodeMessage(frame, &type, &missionId, &sequence, &telemetry));
     QVERIFY(!codec.decodeMessage(QByteArray::fromHex("5555ffff00"), &type, &missionId,
                                  &sequence, &telemetry));
-    frame = telemetryFrame(1134903745u, 900000001u, 12345u);
+    frame = telemetryFrame(900000001u, 1134903745u, 12345u);
     QVERIFY(!codec.decodeMessage(frame, &type, &missionId, &sequence, &telemetry));
-    frame = telemetryFrame(1134903745u, 221500000u, 36001u);
+    frame = telemetryFrame(221500000u, 1134903745u, 36001u);
     QVERIFY(!codec.decodeMessage(frame, &type, &missionId, &sequence, &telemetry));
 }
 
@@ -124,6 +125,35 @@ void DeviceTelemetryProtocolTest::sendsPeriodicHeartbeat()
     QCOMPARE(datagram.senderPort(), controllerPort);
 
     controller.stop();
+}
+
+void DeviceTelemetryProtocolTest::encodesDirectRouteCommands()
+{
+    DeviceTelemetryProtocol codec;
+    RoutePath route;
+    route.valid = true;
+    RoutePoint first;
+    first.position = QPointF(113.4903745, 22.1500000);
+    RoutePoint second;
+    second.position = QPointF(113.4903750, 22.1500010);
+    route.points = {first, second};
+
+    const QVector<QByteArray> patrol = codec.encodeRoute(QStringLiteral("ignored"), route, 65507);
+    QCOMPARE(patrol.size(), 1);
+    const QByteArray frame = patrol.first();
+    QCOMPARE(frame.size(), 24);
+    QCOMPARE(frame.left(5).toHex(), QByteArray("5555001801"));
+    QCOMPARE(frame.mid(5, 8).toHex(), QByteArray("43a541c10d33d260"));
+    QCOMPARE(frame.right(2).toHex(), QByteArray("ffff"));
+    uchar sum = 0;
+    for (int i = 0; i < frame.size() - 3; ++i) sum = uchar(sum + uchar(frame.at(i)));
+    QCOMPARE(uchar(frame.at(frame.size() - 3)), sum);
+
+    const QVector<QByteArray> returning = codec.encodeReturnRoute(QStringLiteral("ignored"), route, 65507);
+    QCOMPARE(returning.size(), 1);
+    QCOMPARE(uchar(returning.first().at(4)), uchar(0x02));
+    QCOMPARE(codec.encodeCommand(QStringLiteral("ignored"), QStringLiteral("mission_stop")).toHex(),
+             QByteArray("5555000800b2ffff"));
 }
 
 QTEST_APPLESS_MAIN(DeviceTelemetryProtocolTest)

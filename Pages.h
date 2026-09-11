@@ -109,6 +109,7 @@ private:
                                             bool *wasAdjusted = nullptr) const;
     bool usingManualTestDevice() const;
     bool hasUsableDeviceOrigin() const;
+    QString preparedMissionAvailabilityMessage() const;
     double activeDeviceHeadingDegrees() const;
     QDateTime activeDeviceTimestamp() const;
     QPointF actualDeviceGcj02() const;

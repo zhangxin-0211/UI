@@ -459,7 +459,7 @@ std::vector<GeoPose> planGeoHybridAstar(const GeoPose& start, const GeoPose& goa
     const double grid_xy = 10.0;
     const double window_len = 200.0;
     const double corridor0 = 70.0;
-    const double obs_safe = 5.0; // 障碍物安全距离5米
+    const double obs_safe = 3.0; // 障碍物安全距离5米
     const int max_iter_local = 20000;
     const double world_max = 5000.0;
     const double coarse_grid = 10.0;

@@ -29,3 +29,17 @@ third_party/opencv/x64/vc15/bin/*.pdb
 
 # Local map authorization: never commit API credentials or provider URLs.
 amap.local.ini
+
+
+# Local temporary files and generated packages
+.artifact-work/
+.qmake.stash
+debug/
+release/
+installer/
+outputs/
+*.dll
+*.pdb
+*.pro.user
+CSV/
+*_recognition_result.png

@@ -166,6 +166,25 @@ void UdpRobotController::beginMissionTransfer(const PreparedMission &mission, bo
         emit uploadFailed(QStringLiteral("双向心跳尚未建立，禁止上传任务"));
         return;
     }
+    if (codec->usesDirectRouteCommands()) {
+        const RoutePath &route = returning ? mission.returnRoute : mission.outboundRoute;
+        if (!mission.valid || !route.valid || route.points.isEmpty() || !isTelemetryFresh()) {
+            emit uploadFailed(QStringLiteral("任务路线无效或设备遥测已过期"));
+            return;
+        }
+        constexpr int maximumUdpPayloadBytes = 65507;
+        const QVector<QByteArray> packets = returning
+            ? codec->encodeReturnRoute(mission.missionId, route, maximumUdpPayloadBytes)
+            : codec->encodeRoute(mission.missionId, route, maximumUdpPayloadBytes);
+        if (packets.size() != 1 || packets.first().isEmpty()) {
+            emit uploadFailed(QStringLiteral("路线超过单包协议容量或坐标编码失败"));
+            return;
+        }
+        sendDatagram(packets.first());
+        emit uploadProgress(1, 1);
+        emit routeUploaded(mission.missionId);
+        return;
+    }
     if (!codec->supportsMissionContext()) {
         emit uploadFailed(QStringLiteral("设备协议尚未定义起点、目标和路线任务帧，禁止下发"));
         return;
@@ -312,9 +331,14 @@ void UdpRobotController::readPendingDatagrams()
         }
         if (type == QStringLiteral("telemetry") && telemetry.valid) {
             m_lastTelemetryTime = telemetry.timestamp;
+            // UDP is connectionless. A validated telemetry frame from the
+            // configured device proves the same practical reachability as a
+            // dedicated heartbeat, so it also establishes the link.
+            m_lastDeviceHeartbeatTime = QDateTime::currentDateTimeUtc();
+            updateHeartbeatLinkState();
             if (isLinkEstablished())
                 setLinkState(RobotLinkState::Online,
-                             QStringLiteral("双向心跳已建立 · 真实设备遥测正常"));
+                             QStringLiteral("UDP 链路已建立 · 真实设备遥测正常"));
             emit telemetryReceived(telemetry);
             continue;
         }
@@ -430,10 +454,22 @@ void UdpRobotController::returnMission(const QString &missionId)
 
 void UdpRobotController::stopMission(const QString &missionId)
 {
-    if (!m_externalCodec || m_socket->state() != QAbstractSocket::BoundState
-        || !m_pendingCommand.data.isEmpty()) {
+    if (!m_externalCodec || m_socket->state() != QAbstractSocket::BoundState) {
         return;
     }
+    if (m_externalCodec->usesDirectRouteCommands()) {
+        const QByteArray command = m_externalCodec->encodeCommand(
+            missionId, QStringLiteral("mission_stop"));
+        if (command.isEmpty()) {
+            emit commandFailed(QStringLiteral("停止"), missionId,
+                               QStringLiteral("停止指令编码失败"));
+            return;
+        }
+        sendDatagram(command);
+        emit commandAcknowledged(QStringLiteral("停止"), missionId);
+        return;
+    }
+    if (!m_pendingCommand.data.isEmpty()) return;
     m_pendingCommand.data = m_externalCodec->encodeCommand(
         missionId, QStringLiteral("mission_stop"));
     m_pendingCommand.expectedType = QStringLiteral("stop_ack");
@@ -472,10 +508,10 @@ void UdpRobotController::updateHeartbeatLinkState()
 {
     if (isLinkEstablished()) {
         setLinkState(RobotLinkState::Online,
-                     QStringLiteral("双向心跳已建立，等待或接收设备遥测"));
+                     QStringLiteral("UDP 链路已建立，等待或接收设备遥测"));
     } else if (m_localHeartbeatSent) {
         setLinkState(RobotLinkState::Listening,
-                     QStringLiteral("本机心跳已发送，等待设备心跳"));
+                     QStringLiteral("本机心跳已发送，等待设备有效 UDP 报文"));
     }
 }
 

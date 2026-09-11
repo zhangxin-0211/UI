@@ -41,6 +41,10 @@ public:
     // A production codec must explicitly opt in and encode headingRadians for
     // every outbound and return waypoint. Upload is rejected otherwise.
     virtual bool supportsWaypointHeadings() const { return false; }
+    // Some device protocols define a route frame as the execution command
+    // itself.  Such a protocol has no separate context/commit/start frames
+    // and does not acknowledge UDP datagrams on the wire.
+    virtual bool usesDirectRouteCommands() const { return false; }
     virtual QVector<QByteArray> encodeReturnRoute(const QString &missionId,
                                                   const RoutePath &route,
                                                   int maximumDatagramBytes) const
@@ -88,7 +92,11 @@ public:
     bool isLinkEstablished() const;
     bool hasExternalProtocolCodec() const { return bool(m_externalCodec); }
     bool hasMissionProtocolCodec() const
-    { return m_externalCodec && m_externalCodec->supportsMissionContext(); }
+    {
+        return m_externalCodec
+            && (m_externalCodec->supportsMissionContext()
+                || m_externalCodec->usesDirectRouteCommands());
+    }
 
 signals:
     void linkStateChanged(RobotLinkState state, const QString &message);

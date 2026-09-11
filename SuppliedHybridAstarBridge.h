@@ -3,8 +3,8 @@
 #include "MissionTypes.h"
 
 struct SuppliedHybridAstarParameters {
-    double shoreSafetyMeters = 5.0;
-    double boundaryPointSpacingMeters = 4.0;
+    double shoreSafetyMeters = 3.0;
+    double boundaryPointSpacingMeters = 2.0;
     double maximumPlanningDistanceMeters = 5000.0;
 };
 
